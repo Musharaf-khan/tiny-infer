@@ -1,0 +1,9 @@
+# torch is assumed to be installed already (Colab/RunPod images ship a CUDA build)
+transformers>=4.45
+accelerate
+fastapi
+uvicorn
+httpx
+ninja          # needed by torch.utils.cpp_extension to JIT-build the CUDA kernels
+matplotlib
+pytest
