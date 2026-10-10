@@ -33,7 +33,7 @@ Each launch reads and writes the activation through HBM.
 
 **Roofline.** One read of x and the residual, one write of h and y, about 2 FLOP/byte. The kernel is purely memory-bound, so the right score is GB/s against the 320 GB/s peak.
 
-The decode shapes are a catch: T = batch size rows (1-64) × 2,048 → only 4-256 KiB per call. At those sizes **launch overhead dominates**, not bandwidth. Collapsing about 9 launches into 1 is the real win; GB/s per launch matters less.
+The decode shapes are a catch: T = batch-size rows × 2,048 → only 20–516 KB per call at batch 1–32 (read x, residual, weight; write h, y). At those sizes **launch overhead dominates**, not bandwidth. Collapsing the 9 PyTorch ops of the reference implementation into 1 launch is the real win; GB/s per launch matters less.
 
 | Shape (T × 2,048) | PyTorch | Kernel | Speedup | GB/s |
 |---|---:|---:|---:|---:|
@@ -42,7 +42,7 @@ The decode shapes are a catch: T = batch size rows (1-64) × 2,048 → only 4-25
 | 32 | 132.7 µs | 12.6 µs | 10.5x | 41.9 |
 | 128 | 165.9 µs | 12.4 µs | **13.4x** | 170.0 |
 
-The PyTorch time is flat at about 133 µs from 1 to 32 rows: it is all launch overhead from roughly 9 small kernels. The kernel is flat at about 13 µs: a single launch whose data fits in one wave. Only at 128 rows does bandwidth start to show, at 170 GB/s (53% of peak).
+The PyTorch time is flat at about 133 µs from 1 to 32 rows: it is dominated by the per-op overhead of the 9 separate PyTorch ops. The kernel is flat at about 13 µs: a single launch whose data fits in one wave. Only at 128 rows does bandwidth start to show, at 170 GB/s (53% of peak).
 
 ## Kernel 2: GQA-aware paged decode attention (split-K)
 
@@ -134,7 +134,7 @@ GPU idle shrank too, because the step now launches far fewer kernels.
 **Why the end-to-end gain (1.5–3.5x) is smaller than the op-level gain (up to 13x): Amdahl.**
 
 After the kernels, the batch-32 decode step is 26.6 GPU-ms:
-- 11.9 ms of weight GEMMs, which the kernels don't touch. 2.05 GB of weights in 11.9 ms is 172 GB/s, 54% of peak.
+- 11.9 ms of weight GEMMs, which the kernels don't touch. About 2.07 GB of layer and `lm_head` weights in 11.9 ms is about 174 GB/s, 54% of peak (weight total from `results/hf_baseline.json` minus the 131 MB embedding table).
 - 13.2 ms of attention.
 - about 1.5 ms of everything else.
 

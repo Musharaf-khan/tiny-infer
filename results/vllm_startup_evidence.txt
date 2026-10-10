@@ -1,0 +1,12 @@
+# Excerpt of results/server_vllm.log from the T4 run (vLLM 0.31.0). The full log is git-ignored.
+# Evidence for docs/vllm_gap.md: vLLM's attention backend on sm_75, torch.compile and CUDA-graph capture.
+Initializing a V1 LLM engine (v0.31.0) with config: model='TinyLlama/TinyLlama-1.1B-Chat-v1.0', speculative_config=None, tokenizer='TinyLlama/TinyLlama-1.1B-Chat-v1.0', skip_tokenizer_init=False, toke
+Using TRITON_ATTN attention backend out of potential backends: ['TRITON_ATTN', 'FLEX_ATTENTION'].
+torch.compile took 19.61 s in total
+CUDA graph pool memory: 0.09 GiB (actual), 0.19 GiB (estimated), difference: 0.1 GiB (118.2%).
+init engine (profile, create kv cache, warmup model) took 65.81 s (compilation: 19.61 s)
+Capturing CUDA graphs (PIECEWISE): 100%|██████████| 35/35
+Capturing CUDA graphs (PIECEWISE): 100%|██████████| 35/35
+Capturing CUDA graphs (FULL): 100%|██████████| 2/2
+Capturing CUDA graphs (PIECEWISE): 100%|██████████| 35/35
+Capturing CUDA graphs (FULL): 100%|██████████| 19/19

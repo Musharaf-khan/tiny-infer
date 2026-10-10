@@ -57,7 +57,7 @@ Paging also made two more features cheap:
 
 Two kernels from the last project went into decode, adapted to it:
 
-1. **Fused residual-add + RMSNorm.** It replaces a chain of about 9 tiny PyTorch kernels with 1, run 45 times per token.
+1. **Fused residual-add + RMSNorm.** It replaces 9 separate PyTorch ops with one kernel launch, 45 times per token (twice per layer, plus the final norm).
 2. **A paged decode-attention kernel.** My old attention kernel was built for prefill, with many query rows sharing each K/V tile. Decode has *one* query row, so there's nothing to share, and the job turned into pure streaming. Three things mattered:
    - reading K/V straight through the block table;
    - letting all 8 query heads that share a KV head (grouped-query attention) use each K/V row loaded once;
@@ -71,7 +71,7 @@ Before writing them, I profiled one decode step at 32 users: 80 ms, and **32 ms 
 | copying K/V | 32 ms | 0.5 ms |
 | output tok/s at 64 users | 341 | **939** |
 
-At the op level, the RMSNorm kernel is 10x faster, all of it launch overhead. One launch replaces nine, and at decode sizes the data is tiny. The attention kernel is 6.6x faster. Output tokens were identical with and without the kernels at every batch size.
+At the op level, the RMSNorm kernel is 10x faster, all of it launch overhead. One launch replaces nine ops, and at decode sizes the data is tiny. The attention kernel is up to 6.7x faster. Output tokens were identical with and without the kernels at every batch size.
 
 The end-to-end gain is smaller than the op-level gain, and Amdahl's law says why: about half of the remaining step is the weight-reading GEMMs, which my kernels don't touch.
 
@@ -79,7 +79,7 @@ The end-to-end gain is smaller than the op-level gain, and Amdahl's law says why
 
 Before the kernels, tiny-infer ran at 26–38% of vLLM's throughput. After them, **58–71%**, and its time-to-first-token is actually lower than vLLM's. The remaining gap is all decode, and the profiler gives three reasons:
 
-1. **Launch overhead at small batch.** About 300 kernel launches per token from eager PyTorch. vLLM replays a captured CUDA graph.
+1. **Overhead at small batch.** At batch 1 my decode step is 16.6 ms against a 6.9 ms weight-read floor. vLLM's log shows it captured CUDA graphs. My engine launches every op eagerly from Python, so that's the likely cause; a batch-1 profile would prove it.
 2. **My attention kernel still uses only 15% of the T4's bandwidth.** Smaller split-K partitions are already measured to be faster.
 3. **Everything runs in one Python process.** The decode step takes 45 ms offline but 62 ms behind the HTTP server at 64 users.
 

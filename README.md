@@ -13,7 +13,9 @@ A from-scratch LLM inference server: an iteration-level **continuous batching** 
 | Project 1 kernels in the engine | **2.75x faster** at 64 users |
 | vs vLLM | **58–71% of vLLM's throughput**, with lower median TTFT |
 
-**Model:** TinyLlama-1.1B-Chat, FP16. **GPU:** one NVIDIA T4 (Turing, sm_75, 320 GB/s, 15 GiB). **Code:** about 1,500 lines of engine Python and 480 lines of CUDA/C++, plus 1,600 lines of benchmarks and tests. **Correctness:** greedy output is token-identical to HuggingFace's in the test suite, on every code path, including the ones that preempt and recompute. On the T4, output with the CUDA kernels is identical to output without them.
+**Model:** TinyLlama-1.1B-Chat, FP16. **GPU:** one NVIDIA T4 (Turing, sm_75, 320 GB/s, 15 GiB). **Code:** about 1,500 lines of engine Python and 480 lines of CUDA/C++, plus 1,700 lines of benchmarks, scripts and tests. **Correctness:** see [the correctness table](#correctness-what-is-proven-and-by-which-check). The test suite proves token-identical output to HuggingFace on a small random Llama, and on the T4 the CUDA kernels leave real TinyLlama's output unchanged. The real-model check against HuggingFace is pending a re-run.
+
+**What it is:** a working prototype of a single-GPU LLM inference server: an engine plus an HTTP API, run on a GPU you start yourself. It is not a hosted service or a website.
 
 ---
 
@@ -70,7 +72,7 @@ All numbers come from [`notebooks/t4_runbook.ipynb`](notebooks/t4_runbook.ipynb)
 
 **Paging fit 6.2x more sequences in the same memory and cut KV waste from 79.7% to 1.5%.** The vLLM paper reports going from 60–80% waste to under 4%.
 
-The closed form predicted 23 sequences for contiguous allocation, which matched exactly. For paged allocation it predicted about 96 at the mean *final* length. Paged peaked higher, at 143, because sequences early in their output are still short. Being that optimistic is what causes the 21 recompute preemptions.
+The closed form predicted 23 sequences for contiguous allocation, which matched exactly. For paged allocation it predicted about 96 at the mean *final* length. Paged peaked higher, at 143, because sequences early in their output are still short. That optimism is why paged mode needed 21 recompute preemptions; contiguous mode, which reserves the maximum up front, needed none.
 
 ### Differentiators: prefix caching and chunked prefill (16 users)
 
@@ -97,11 +99,11 @@ The closed form predicted 23 sequences for contiguous allocation, which matched 
 
 | Kernel | Replaces | Op speedup (T4) | End-to-end |
 |---|---|---:|---|
-| fused residual-add + RMSNorm (FP16) | `x + residual` then HF `LlamaRMSNorm` (a chain of ~8 small kernels) | **10.3–13.4x** (133 → 13 µs at batch 32) | – |
+| fused residual-add + RMSNorm (FP16) | `x + residual` then HF `LlamaRMSNorm` (9 separate PyTorch ops in the reference code) | **10.3–13.4x** (133 → 13 µs at batch 32) | – |
 | GQA paged decode attention (Flash-Decoding split-K) | gather-from-blocks + `repeat_interleave` + SDPA | **3.3–6.7x** (4.59 → 0.69 ms at 32 seqs × 1,024 ctx) | – |
 | **both, in the engine** | | | decode step **1.47x / 2.50x / 2.86x / 3.49x** faster at batch 1 / 16 / 32 / 64; greedy output identical with and without kernels at every batch size |
 
-- **The RMSNorm speedup is launch overhead, not bandwidth.** At decode shapes a call moves only 16–512 KB, and one launch replaces about 9.
+- **The RMSNorm speedup is launch overhead, not bandwidth.** At decode shapes (batch 1–32) a call moves only 20–516 KB, and one launch replaces 9 separate PyTorch ops.
 - **The attention speedup grows with batch × context,** because that's what the gather path copies. Its end-to-end effect therefore grows with load.
 - **The attention kernel is now the largest item at batch 64** (25.7 of 39.4 GPU-ms). It reaches 49 GB/s, which is 15% of the T4's 320 GB/s. 128-token partitions beat 512-token ones in every measured shape (1.4–3.4x), but the engine still uses 512 because 128 hasn't been measured end to end yet. That is the next step.
 
@@ -138,7 +140,7 @@ flowchart LR
 | prefix-cache hit | `num_computed_tokens` starts above 0 |
 | preemption | `num_computed_tokens` is reset to 0 and the sequence is recomputed |
 
-They all share one code path and are all checked by the same oracle.
+They all share one code path, and the test-suite oracle (check 1 below) covers each of them.
 
 ```text
 loop forever:                                       # tiny_infer/scheduler.py
@@ -200,30 +202,50 @@ Useful server flags:
 | `scripts/check_correctness.py` | real-model oracle against HF: fp32 must be identical; in fp16 every divergence is reported with its top-2 logit gap |
 | `bench/make_report.py` | `results/*.json` → `results/REPORT.md` and charts |
 
-## Tests
+## Correctness: what is proven, and by which check
+
+Four separate checks, each proving something different. Only the first three have passed so far.
+
+| Check | What it compares | Where it runs | Status |
+|---|---|---|---|
+| **1. Test-suite oracle** | tiny-infer vs HF `generate()`, token for token, on a small random Llama (GQA, RoPE, RMSNorm, SwiGLU) in FP32 | CPU, `pytest`, GitHub Actions on every push | **Passed: 29/29 tests** |
+| **2. Kernels vs PyTorch ops** | tiny-infer *with* the CUDA kernels vs tiny-infer *without* them, on real TinyLlama: 256 greedy tokens at batch 1, 16, 32 and 64 | T4 (`results/kernel_bench.json`) | **Passed: 100% of sequences identical** |
+| **3. Kernel self-test** | each CUDA kernel vs its PyTorch reference on random tensors (ragged lengths, shuffled blocks, GQA 8 and 1) | T4, on every engine start with `--custom-kernels` | **Passed: worst max abs error 2.0e-3** (FP16) |
+| **4. Real-model oracle** | tiny-infer vs HF `generate()` on real TinyLlama: 12 prompts, FP32 / FP16 / FP16 + kernels | T4, `scripts/check_correctness.py` | **Not yet established** (see below) |
+
+**What this does and does not prove.**
+- Check 1 proves the engine's logic matches HF on every code path:
+  - batched and paged;
+  - unfused weights;
+  - no chunking;
+  - a 7-token budget (many chunks);
+  - contiguous allocation;
+  - one sequence at a time;
+  - 16-token blocks;
+  - forced recompute-preemption;
+  - prefix-cache hits;
+  - EOS handling.
+- Check 2 proves the CUDA kernels don't change the real model's output.
+- Neither check alone proves that tiny-infer reproduces HF on the *real* model's weights. That is check 4's job.
+
+**Check 4 history.**
+- **First run: invalid.** The script passed `min_new_tokens` to HF, which suppresses EOS, while the engine could still pick it. As a result, 4 of 12 prompts "diverged" at identical positions in all three modes.
+- **Fix:** both sides now stop at EOS naturally. A CPU regression test (`test_eos_handling_matches_hf`) reproduces the failure and passes with the fix.
+- **Pending:** the fixed script has **not yet been re-run on the T4**. Until it is, this README makes no claim that tiny-infer matches HF token for token on real TinyLlama.
+
+Run the tests:
 
 ```bash
 python -m pytest tests -q      # 29 tests, CPU, ~15 s
 ```
 
-The tests build a small random Llama (GQA, RoPE, RMSNorm, SwiGLU) and require **token-identical** greedy output against HF `generate()` under all of these configurations:
+The other tests cover:
+- block-manager invariants;
+- scheduler policy;
+- real HTTP/SSE streaming with concurrent clients;
+- the SSE parser and the kernel self-test construction.
 
-- batched and paged
-- unfused weights
-- no chunking
-- a 7-token budget (many chunks)
-- contiguous allocation
-- one sequence at a time
-- 16-token blocks
-- forced recompute-preemption
-- prefix-cache hits
-
-The other tests cover block-manager invariants and scheduler policy, plus real HTTP/SSE streaming with concurrent clients. **Real-model oracle (TinyLlama on the T4):** `scripts/check_correctness.py` compares 12 prompts against HF `generate()`.
-- **First run: flawed check.** The check passed `min_new_tokens` to HF, which hides EOS, while the engine was free to pick it. As a result, 4 of 12 prompts "diverged" at the same positions in FP32, FP16 and FP16 with kernels.
-- **Fix:** both sides now stop at EOS naturally. A CPU regression test reproduces the original failure and passes after the fix.
-- **Pending:** the fixed check has not yet been re-run on the T4.
-
-The CUDA kernels self-test against the PyTorch reference every time the engine starts with `--custom-kernels`. The engine refuses to serve if any kernel disagrees.
+The engine refuses to serve if any kernel fails its startup self-test.
 
 ## Honest scope
 

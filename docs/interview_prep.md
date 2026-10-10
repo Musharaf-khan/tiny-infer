@@ -79,7 +79,7 @@ Back each one with a number from `step_profile`.
 ## 7. "How would you serve 10x more users on the same GPU?" (in this order)
 
 1. **Batching.** Continuous batching uses decode's spare FLOPs. Throughput rises roughly linearly with batch until compute or KV bandwidth binds.
-2. **Paging.** It removes the reservation waste, which on this workload means about 4x more sequences in the same pool (runbook step 10).
+2. **Paging.** It removes the reservation waste, which on this workload measured 6.2x more concurrent sequences in the same 1 GiB pool (23 → 143; `results/kv_capacity.json`).
 3. **Prefix caching.** A shared system prompt is stored once and its prefill skipped. This cuts memory and TTFT for agents and RAG.
 4. **Quantisation.**
    - INT8/FP8 KV halves the cache, which doubles concurrency again.
