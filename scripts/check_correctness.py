@@ -71,7 +71,7 @@ def main():
     eng = LLMEngine(cfg, model=model, tokenizer=tok)
     seqs = eng.generate(PROMPTS, SamplingParams(max_tokens=a.max_new, ignore_eos=True))
 
-    exact, bad = 0, 0
+    exact, bad, divergences = 0, 0, []
     for i, (s, e) in enumerate(zip(seqs, expected)):
         got = s.output_ids
         if got == e:
@@ -83,10 +83,17 @@ def main():
         # fp32: only an exact tie may flip (cuBLAS picks different tiles for batch 1 vs batch N)
         near_tie = gap <= (a.margin if a.dtype == "float16" else 1e-3)
         bad += 0 if near_tie else 1
+        divergences.append({"prompt": i, "token": j, "top2_gap": gap, "near_tie": near_tie})
         print(f"prompt {i}: diverges at token {j}; HF top-2 logit gap there = {gap:.3f} "
               f"({'near-tie: fp16 rounding' if near_tie else 'REAL MISMATCH'})")
     print(f"\n{exact}/{len(PROMPTS)} prompts token-identical to HF ({a.dtype}, "
           f"kernels={'on' if a.custom_kernels else 'off'}, {a.max_new} tokens each)")
+    import json
+    os.makedirs("results", exist_ok=True)
+    out = f"results/correctness_{a.dtype}{'_kernels' if a.custom_kernels else ''}.json"
+    json.dump({"dtype": a.dtype, "custom_kernels": a.custom_kernels, "prompts": len(PROMPTS),
+               "tokens_per_prompt": a.max_new, "identical": exact, "divergences": divergences,
+               "pass": bad == 0}, open(out, "w"), indent=2)
     if bad:
         print("FAIL")
         sys.exit(1)

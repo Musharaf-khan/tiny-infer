@@ -4,41 +4,88 @@ A from-scratch LLM inference server: an iteration-level **continuous batching** 
 
 **The chain:** [cuda-kernel-lab](https://github.com/Musharaf-khan/cuda-kernel-lab) produced kernels that beat PyTorch ops in isolation. tiny-infer puts them inside a serving engine and measures what they change end to end, in tokens per second.
 
-**Model:** TinyLlama-1.1B-Chat, FP16. **GPU:** one NVIDIA T4 (Turing, sm_75, 320 GB/s, 15 GiB). **Code:** about 1,500 lines of engine Python and 480 lines of CUDA/C++, plus 1,600 lines of benchmarks and tests. **Correctness:** greedy output is token-identical to HuggingFace's. This is checked on every code path, including the ones that preempt and recompute.
+**Model:** TinyLlama-1.1B-Chat, FP16. **GPU:** one NVIDIA T4 (Turing, sm_75, 320 GB/s, 15 GiB). **Code:** about 1,500 lines of engine Python and 480 lines of CUDA/C++, plus 1,600 lines of benchmarks and tests. **Correctness:** greedy output is token-identical to HuggingFace's in the test suite, on every code path, including the ones that preempt and recompute.
 
 ---
 
-## Results (T4, FP16)
+## Results (Tesla T4, FP16, measured)
 
-> **Status:** the numbers below come from running [`notebooks/t4_runbook.ipynb`](notebooks/t4_runbook.ipynb) top to bottom on a Colab T4. That run generates [`results/REPORT.md`](results/REPORT.md); its tables are pasted here unedited. Cells showing `—` are still waiting for a measured value. Nothing in this README is estimated.
+All numbers come from [`notebooks/t4_runbook.ipynb`](notebooks/t4_runbook.ipynb) on a Colab T4. Raw data and the auto-generated report are in [`results/`](results/REPORT.md).
+
+**Workload:** prompts of 128–512 tokens and outputs of 64–256 tokens. Prompts are sent as token IDs with `ignore_eos`, so every system generates the same tokens. The client runs a closed loop at fixed concurrency and times everything over HTTP/SSE.
 
 ### Serving comparison (same workload, same client, same GPU)
 
-| System | Concurrency | Output tok/s | p50 TTFT | p99 TTFT | p50 TPOT | Peak running seqs |
+| System | Concurrency | Output tok/s | p50 TTFT | p99 TTFT | p50 TPOT | GPU util |
 |---|---:|---:|---:|---:|---:|---:|
-| HF `generate()` (baseline) | 1 | — | — | — | — | 1 |
-| Naive server (one `generate()` at a time) | 1 / 4 / 16 | — | — | — | — | 1 |
-| tiny-infer (batched + paged) | 1 / 4 / 16 / 32 / 64 | — | — | — | — | — |
-| tiny-infer + Project 1 kernels | 1 / 4 / 16 / 32 / 64 | — | — | — | — | — |
-| vLLM (official) | 1 / 4 / 16 / 32 / 64 | — | — | — | — | — |
+| HF `generate()` in-process (baseline) | 1 | 35.6 | 76 ms | – | 28.1 ms | – |
+| HF static batching (padded, offline) | 16 / 32 | 230.5 / 253.7 | – | – | – | – |
+| Naive server (one `generate()` at a time) | 1 | 32.9 | 82 ms | 112 ms | 29.0 ms | 47% |
+| | 4 | 32.9 | **15.5 s** | 18.3 s | 29.8 ms | 47% |
+| | 16 | 33.1 | **36.7 s** | **77.0 s** | 29.0 ms | 47% |
+| **tiny-infer** (continuous batching + paged KV) | 1 | 36.4 | 43 ms | 54 ms | 26.5 ms | 47% |
+| | 4 | 106.3 | 92 ms | 213 ms | 32.7 ms | 58% |
+| | 16 | 256.6 | 144 ms | 837 ms | 55.2 ms | 77% |
+| | 32 | 311.2 | 234 ms | 1.58 s | 94.7 ms | 83% |
+| | 64 | 340.9 | 420 ms | 3.27 s | 178.8 ms | 87% |
+| tiny-infer + Project 1 kernels | 1–64 | *rerun pending* | | | | |
+| **vLLM 0.31.0** (`--dtype half`, prefix caching off) | 1 | 100.3 | 69 ms | 92 ms | 9.6 ms | 99% |
+| | 4 | 276.0 | 92 ms | 216 ms | 12.3 ms | 98% |
+| | 16 | 759.2 | 104 ms | 825 ms | 18.0 ms | 99% |
+| | 32 | 1,018.9 | 135 ms | 1.46 s | 27.1 ms | 99% |
+| | 64 | 1,331.1 | 232 ms | 2.95 s | 43.1 ms | 99% |
 
-Throughput, TTFT and TPOT vs concurrency are plotted to `results/serving.png` by the same run.
+**What the table shows:**
 
-### Paged vs contiguous KV cache (1 GiB pool, same kernels)
+- **Continuous batching vs the naive server.**
+  - The naive server's throughput is flat at about 33 tok/s whatever the load. Its TTFT grows with queue depth instead, reaching a p99 of 77 s at 16 users. That is the Phase 2 collapse.
+  - tiny-infer serves the same load at **3.2x the naive server's throughput at 4 users and 7.75x at 16 users**, with p50 TTFT staying under 150 ms.
+  - Against an idealised HF static batch, where all requests arrive together and run offline, tiny-infer is **1.11x faster at 16 users and 1.23x at 32**. It also streams, and admits new requests every step instead of every batch.
+- **vs vLLM: tiny-infer reaches 26–38% of vLLM's throughput** (36% at 1 user, 34% at 16, 26% at 64).
+  - The gap is mostly in TPOT, which grows from 26 to 179 ms in tiny-infer but only from 10 to 43 ms in vLLM.
+  - The profile below shows why, and [docs/vllm_gap.md](docs/vllm_gap.md) breaks it down.
 
-| Allocation | Peak concurrent sequences | Mean KV waste | Output tok/s |
-|---|---:|---:|---:|
-| contiguous (reserve `max_model_len`) | — | — | — |
-| paged (16-token blocks, on demand) | — | — | — |
+![Throughput, TTFT and TPOT vs concurrency on a T4](results/serving.png)
 
-Closed form for this workload: a 1 GiB pool holds 47,648 token slots at 22,528 B/token. Contiguous reservation of 2,048 tokens fits **23** sequences. Paged allocation at the workload's mean final length of about 480 tokens fits about **96**. The measured numbers above test that prediction.
+### Paged vs contiguous KV cache (1 GiB pool, same kernels, 256 requests submitted at once)
+
+| Allocation | Peak concurrent sequences | Mean KV waste | Preemptions | Output tok/s |
+|---|---:|---:|---:|---:|
+| contiguous (reserve `max_model_len` = 2,048) | 23 | 79.7% | 0 | 314.9 |
+| **paged** (16-token blocks, on demand) | **143** | **1.5%** | 21 | **381.5** |
+
+**Paging fit 6.2x more sequences in the same memory and cut KV waste from 79.7% to 1.5%.** The vLLM paper reports going from 60–80% waste to under 4%.
+
+The closed form predicted 23 sequences for contiguous allocation, which matched exactly. For paged allocation it predicted about 96 at the mean *final* length. Paged peaked higher, at 143, because sequences early in their output are still short. Being that optimistic is what causes the 21 recompute preemptions.
+
+### Differentiators: prefix caching and chunked prefill (16 users)
+
+| Run | p50 TTFT | p99 TTFT | p99 ITL | Output tok/s |
+|---|---:|---:|---:|---:|
+| 1,024-token shared system prompt, prefix caching **off** | 376 ms | 2,714 ms | 304 ms | 120.4 |
+| same, prefix caching **on** (84% of prompt tokens hit) | **209 ms** | **707 ms** | **130 ms** | **170.5** |
+| prompts of 64–1,900 tokens, no chunking | 363 ms | 2,673 ms | 303 ms | 123.8 |
+| same, chunked prefill (512-token budget) | 691 ms | 4,036 ms | **169 ms** | 122.6 |
+
+- **Prefix caching:** 3.8x lower p99 TTFT, 1.8x lower p50 TTFT, and 1.42x the throughput.
+- **Chunked prefill is a trade-off.** It cut the p99 inter-token latency of running streams by 44%, because no decode waits behind a 1,900-token prefill. But it raised TTFT, because a 512-token budget spreads every long prompt over several steps. In other words, it protects users who are already streaming at the expense of newcomers. That is the reason vLLM tunes the budget instead of fixing it.
+
+### Where a decode step goes (batch 32, `torch.profiler`)
+
+| Wall time | GPU busy | GPU idle (CPU-side) | Copy / gather | GEMM-class | Roofline floor |
+|---:|---:|---:|---:|---:|---:|
+| 79.5 ms | 65.7 ms | 13.8 ms | **31.6 ms** | 31.2 ms | 7.7 ms |
+
+**Half of the GPU time is spent copying K/V.** The PyTorch decode-attention path gathers each sequence's K/V out of the block pool and `repeat_interleave`s it 8x for GQA before SDPA. That is exactly the traffic the Project 1 paged-attention kernel removes. The GEMM-class bucket also includes SDPA's batched matmuls, because sm_75 falls back to the math path.
 
 ### Project 1 kernels in the decode path
 
 | Kernel | Replaces | Op speedup | Decode-step (TPOT) speedup @ batch 32 |
 |---|---|---:|---:|
-| fused residual-add + RMSNorm (FP16) | `x + residual` then HF `LlamaRMSNorm` (a chain of ~8 small kernels) | — | — |
-| GQA paged decode attention (split-K) | gather-from-blocks + `repeat_interleave` + SDPA | — | — |
+| fused residual-add + RMSNorm (FP16) | `x + residual` then HF `LlamaRMSNorm` (a chain of ~8 small kernels) | *rerun pending* | *rerun pending* |
+| GQA paged decode attention (split-K) | gather-from-blocks + `repeat_interleave` + SDPA | *rerun pending* | *rerun pending* |
+
+The first T4 run did not produce kernel numbers. A bug in the kernel **self-test harness** (its block pool was smaller than its block tables) stopped the engine at startup. The fix is in, and a regression test now covers it. [`notebooks/t4_kernels_rerun.ipynb`](notebooks/t4_kernels_rerun.ipynb) re-runs only the kernel steps.
 
 Write-up: [docs/kernels.md](docs/kernels.md). Gap to vLLM, with a profiler breakdown: [docs/vllm_gap.md](docs/vllm_gap.md).
 
@@ -138,7 +185,7 @@ Useful server flags:
 ## Tests
 
 ```bash
-python -m pytest tests -q      # 26 tests, CPU, ~15 s
+python -m pytest tests -q      # 28 tests, CPU, ~30 s
 ```
 
 The tests build a small random Llama (GQA, RoPE, RMSNorm, SwiGLU) and require **token-identical** greedy output against HF `generate()` under all of these configurations:

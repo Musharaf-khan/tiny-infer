@@ -128,6 +128,32 @@ def main():
                          f"{fmt(s['itl_ms_p99'], 1)} ms | {fmt(s['output_tok_s'])} | {fmt(hit * 100 if hit is not None else None, 0)}% |")
         L.append("")
 
+    # ---------------------------------------------------------------- step profile
+    import glob
+    profs = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(d, "step_profile_*.json")))]
+    if profs:
+        L += ["## Where a decode step goes (torch.profiler)", "",
+              "| Batch | Kernels | Wall ms/step | GPU busy | GPU idle (CPU/launch) | GEMM-class | copy/gather | attention | norm | other | Roofline floor | % of floor |",
+              "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for r in profs:
+            b = r["breakdown_ms"]
+            L.append(f"| {r['batch']} | {'on' if r['custom_kernels'] else 'off'} | {r['wall_step_ms']:.1f} | {r['gpu_busy_ms']:.1f} | "
+                     f"{r['gpu_idle_ms (CPU/launch overhead)']:.1f} | {b.get('gemm', 0):.1f} | {b.get('copy/gather', 0):.1f} | "
+                     f"{b.get('attention', 0):.1f} | {b.get('norm', 0):.1f} | {b.get('elementwise/other', 0):.1f} | "
+                     f"{r['roofline_floor_ms']:.1f} | {r['pct_of_roofline']:.0f}% |")
+        L += ["", "GEMM-class includes the batched matmuls inside the PyTorch attention fallback (SDPA's math path on sm_75).", ""]
+
+    # ---------------------------------------------------------------- correctness
+    corr = [json.load(open(f)) for f in sorted(glob.glob(os.path.join(d, "correctness_*.json")))]
+    if corr:
+        L += ["## Correctness vs HF generate() (TinyLlama, greedy)", "",
+              "| dtype | Kernels | Token-identical prompts | Divergences (top-2 logit gap) | Result |", "|---|---|---:|---|---|"]
+        for c in corr:
+            dv = ", ".join(f"p{x['prompt']}@t{x['token']} ({x['top2_gap']:.2f})" for x in c["divergences"]) or "none"
+            L.append(f"| {c['dtype']} | {'on' if c['custom_kernels'] else 'off'} | {c['identical']}/{c['prompts']} "
+                     f"({c['tokens_per_prompt']} tokens each) | {dv} | {'PASS' if c['pass'] else 'FAIL'} |")
+        L.append("")
+
     out = os.path.join(d, "REPORT.md")
     open(out, "w").write("\n".join(L))
     print("\n".join(L))

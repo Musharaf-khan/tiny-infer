@@ -1,0 +1,93 @@
+{
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "gpu": "Tesla T4",
+  "weights_gib": 2.0509538650512695,
+  "c1_ttft_ms_p50": 75.6035764999865,
+  "c1_tpot_ms_p50": 28.12284602376689,
+  "c1_decode_tok_s": 35.5582788155541,
+  "c1_peak_vram_gib": 2.160275936126709,
+  "single_stream": [
+    {
+      "prompt_len": 325,
+      "out": 103,
+      "ttft_ms": 55.870282999990195,
+      "tpot_ms": 29.850170627451362
+    },
+    {
+      "prompt_len": 415,
+      "out": 199,
+      "ttft_ms": 83.93654900010006,
+      "tpot_ms": 28.784239616161106
+    },
+    {
+      "prompt_len": 385,
+      "out": 100,
+      "ttft_ms": 75.27365599992208,
+      "tpot_ms": 27.156014686869586
+    },
+    {
+      "prompt_len": 309,
+      "out": 146,
+      "ttft_ms": 54.612754000004315,
+      "tpot_ms": 30.315392613793254
+    },
+    {
+      "prompt_len": 402,
+      "out": 256,
+      "ttft_ms": 75.93349700005092,
+      "tpot_ms": 27.461452431372678
+    },
+    {
+      "prompt_len": 335,
+      "out": 187,
+      "ttft_ms": 57.03075300004912,
+      "tpot_ms": 30.303258263441016
+    },
+    {
+      "prompt_len": 489,
+      "out": 148,
+      "ttft_ms": 100.21788500000639,
+      "tpot_ms": 27.058361496598565
+    },
+    {
+      "prompt_len": 400,
+      "out": 196,
+      "ttft_ms": 78.60235599991938,
+      "tpot_ms": 27.043239661538674
+    }
+  ],
+  "static_batching": [
+    {
+      "batch": 1,
+      "seconds": 3.4573211840000795,
+      "useful_output_tok_s": 29.791851702025042,
+      "generated_tok_s": 29.791851702025042,
+      "wasted_fraction": 0.0,
+      "peak_vram_gib": 2.1109771728515625
+    },
+    {
+      "batch": 4,
+      "seconds": 5.366121225000029,
+      "useful_output_tok_s": 102.12218043955893,
+      "generated_tok_s": 148.3380577187754,
+      "wasted_fraction": 0.31155778894472363,
+      "peak_vram_gib": 2.172377586364746
+    },
+    {
+      "batch": 16,
+      "seconds": 11.641967775000012,
+      "useful_output_tok_s": 230.4593219851957,
+      "generated_tok_s": 351.83055641124173,
+      "wasted_fraction": 0.344970703125,
+      "peak_vram_gib": 2.6140832901000977
+    },
+    {
+      "batch": 32,
+      "seconds": 20.408214125999848,
+      "useful_output_tok_s": 253.7213676822061,
+      "generated_tok_s": 401.4069996239151,
+      "wasted_fraction": 0.367919921875,
+      "peak_vram_gib": 3.1688413619995117
+    }
+  ]
+}

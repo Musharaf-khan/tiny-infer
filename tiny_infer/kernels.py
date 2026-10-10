@@ -47,10 +47,11 @@ def self_test(device: str = "cuda", seed: int = 0) -> dict:
                                                    (h.float() - h_ref.float()).abs().max().item())
     # paged decode attention: ragged lengths, shuffled physical blocks, GQA 8 and 1, split / no split
     for hq, hkv, hd in ((32, 4, 64), (8, 8, 64), (16, 2, 128)):
-        bs, nb, B = 16, 512, 5
-        kc, vc = r(nb, bs, hkv, hd), r(nb, bs, hkv, hd)
+        bs, B = 16, 5
         lens = torch.tensor([1, 17, 300, 1100, 2048], dtype=torch.int32, device=device)
         maxb = (int(lens.max()) + bs - 1) // bs
+        nb = B * maxb + 16                      # every (sequence, logical block) gets its own physical block
+        kc, vc = r(nb, bs, hkv, hd), r(nb, bs, hkv, hd)
         perm = torch.randperm(nb, generator=torch.Generator().manual_seed(seed))[: B * maxb]
         bt = perm.view(B, maxb).to(torch.int32).to(device)
         q = r(B, hq, hd)

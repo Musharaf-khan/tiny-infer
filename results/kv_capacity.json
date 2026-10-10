@@ -1,0 +1,34 @@
+{
+  "theory": {
+    "kv_bytes_per_token": 22528,
+    "pool_tokens": 47648,
+    "contiguous_max_seqs": 23,
+    "paged_max_seqs_at_mean_final_len": 96,
+    "mean_final_len": 483.24609375,
+    "contiguous_waste_at_mean_len": 0.7640399932861328
+  },
+  "runs": [
+    {
+      "mode": "contiguous",
+      "num_blocks": 2978,
+      "peak_concurrent_seqs": 23,
+      "mean_kv_waste": 0.7974463499864552,
+      "preemptions": 0,
+      "seconds": 131.8927707109999,
+      "output_tok_s": 314.86941836256733,
+      "steps": 1921
+    },
+    {
+      "mode": "paged",
+      "num_blocks": 2978,
+      "peak_concurrent_seqs": 143,
+      "mean_kv_waste": 0.015039457612638227,
+      "preemptions": 21,
+      "seconds": 108.85916505399996,
+      "output_tok_s": 381.49291315434397,
+      "steps": 488
+    }
+  ],
+  "concurrency_gain": 6.217391304347826,
+  "throughput_gain": 1.2115908719819233
+}

@@ -56,6 +56,19 @@ def make_workload(n: int, input_len: tuple[int, int], output_len: tuple[int, int
     return out
 
 
+async def _sse_lines(resp):
+    """Split the SSE stream on '\n' ONLY. httpx.aiter_lines() uses str.splitlines(), which also breaks on
+    U+2028/U+0085 etc.; vLLM emits those raw inside JSON strings, which corrupted ~1% of its streams."""
+    buf = ""
+    async for chunk in resp.aiter_text():
+        buf += chunk
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            yield line.rstrip("\r")
+    if buf:
+        yield buf
+
+
 async def one_request(client: httpx.AsyncClient, url: str, model: str, prompt: list[int], max_tokens: int
                       ) -> RequestResult:
     r = RequestResult(prompt_len=len(prompt), max_tokens=max_tokens)
@@ -68,7 +81,7 @@ async def one_request(client: httpx.AsyncClient, url: str, model: str, prompt: l
             if resp.status_code != 200:
                 r.error = f"HTTP {resp.status_code}: {(await resp.aread())[:200]!r}"
                 return r
-            async for line in resp.aiter_lines():
+            async for line in _sse_lines(resp):
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
