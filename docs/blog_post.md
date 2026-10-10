@@ -1,6 +1,6 @@
 # I built a tiny vLLM from scratch (and put my own CUDA kernels in it)
 
-*Draft. Replace every `[X]` with a measured number from `results/REPORT.md` before publishing.*
+*All numbers are from a Tesla T4. Raw data is in the repo's `results/` folder.*
 
 In my last post I wrote 25 CUDA kernels on a free T4 and got matrix multiply to cuBLAS parity. Kernels that beat PyTorch in a microbenchmark are nice. But the question that kept bugging me was simpler: **does any of it show up when a real user asks a real model a question?**
 
@@ -17,7 +17,7 @@ That second fact is the whole game. **Reading the weights costs the same whether
 
 ## Step 1: the naive server (built to lose)
 
-One request, one `generate()` call, one lock. At 1 user it's fine. At 16 users the 16th person waits for 15 other complete answers before getting a first token: p99 TTFT went from [X] ms to [X] s.
+One request, one `generate()` call, one lock. At 1 user it's fine. At 16 users the 16th person waits for 15 other complete answers before getting a first token: p99 time-to-first-token went from 112 ms at 1 user to 77 seconds at 16, while throughput stayed flat at 33 tok/s.
 
 ## Step 2: continuous batching
 
@@ -34,7 +34,7 @@ every step:
   finished users leave now; their seats are refilled next step
 ```
 
-All of a step's tokens go into one packed tensor. Every weight matrix is read once and multiplied against everyone's tokens. Result at 32 users: **[X]x** the throughput of the naive server.
+All of a step's tokens go into one packed tensor. Every weight matrix is read once and multiplied against everyone's tokens. Result at 16 users: **7.75x** the throughput of the naive server, with median time-to-first-token at 144 ms instead of 37 seconds.
 
 ## Step 3: the memory problem, and paging
 
@@ -46,8 +46,8 @@ Same GPU, same 1 GiB pool, same kernels, only the allocator changed:
 
 | | Users at once | KV waste |
 |---|---:|---:|
-| reserve max length | [X] | [X]% |
-| paged | [X] | [X]% |
+| reserve max length | 23 | 79.7% |
+| paged | 143 | 1.5% |
 
 Paging also made two more features cheap:
 - **Prefix caching:** identical system prompts share physical blocks.
@@ -63,13 +63,27 @@ Two kernels from the last project went into decode, adapted to it:
    - letting all 8 query heads that share a KV head (grouped-query attention) use each K/V row loaded once;
    - splitting long contexts across thread blocks (Flash-Decoding) so 40 SMs have work even at batch 1.
 
-Op level: [X]x and [X]x. End to end: decode steps got **[X]%** faster. That's smaller than the op-level number, and Amdahl's law says why. Most of a decode step is the weight-reading GEMMs, which my kernels don't touch.
+Before writing them, I profiled one decode step at 32 users: 80 ms, and **32 ms of it was copying**. My PyTorch fallback gathered every sequence's K/V out of the blocks and repeated it 8 times so the attention call saw one K/V per query head. The kernel reads each K/V row once, straight through the block table, and shares it across the 8 heads.
+
+| | PyTorch ops | My kernels |
+|---|---:|---:|
+| decode step at 32 users | 80 ms | **29 ms** |
+| copying K/V | 32 ms | 0.5 ms |
+| output tok/s at 64 users | 341 | **939** |
+
+At the op level, the RMSNorm kernel is 10x faster, all of it launch overhead. One launch replaces nine, and at decode sizes the data is tiny. The attention kernel is 6.6x faster. Output tokens were identical with and without the kernels at every batch size.
+
+The end-to-end gain is smaller than the op-level gain, and Amdahl's law says why: about half of the remaining step is the weight-reading GEMMs, which my kernels don't touch.
 
 ## Step 5: losing to vLLM, honestly
 
-vLLM is [X]x faster than tiny-infer at [X] users. The profiler says where it goes.
+Before the kernels, tiny-infer ran at 26–38% of vLLM's throughput. After them, **58–71%**, and its time-to-first-token is actually lower than vLLM's. The remaining gap is all decode, and the profiler gives three reasons:
 
-At small batch my engine is **launch-bound**: about 300 small kernel launches per token, and the GPU idles [X] ms per step waiting on Python. vLLM records the whole decode step as a CUDA graph and replays it with one launch. It also fuses more (RoPE with the cache write, SiLU with the multiply) and overlaps CPU work with GPU work. The full breakdown, and what would close the gap, is in the repo.
+1. **Launch overhead at small batch.** About 300 kernel launches per token from eager PyTorch. vLLM replays a captured CUDA graph.
+2. **My attention kernel still uses only 15% of the T4's bandwidth.** Smaller split-K partitions are already measured to be faster.
+3. **Everything runs in one Python process.** The decode step takes 45 ms offline but 62 ms behind the HTTP server at 64 users.
+
+The full breakdown is in the repo.
 
 ## What I'd tell myself at the start
 

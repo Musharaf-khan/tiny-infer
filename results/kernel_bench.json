@@ -1,0 +1,182 @@
+{
+  "self_test": {
+    "rms_norm[2048]": 0.001953125,
+    "fused_add_rms_norm[2048]": 0.0009765625,
+    "rms_norm[4096]": 0.001953125,
+    "fused_add_rms_norm[4096]": 0.0,
+    "rms_norm[128]": 0.0,
+    "fused_add_rms_norm[128]": 0.0,
+    "paged_attn[hq=32,hkv=4,hd=64,part=512]": 0.00048828125,
+    "paged_attn[hq=32,hkv=4,hd=64,part=128]": 0.00048828125,
+    "paged_attn[hq=8,hkv=8,hd=64,part=512]": 0.00048828125,
+    "paged_attn[hq=8,hkv=8,hd=64,part=128]": 0.00048828125,
+    "paged_attn[hq=16,hkv=2,hd=128,part=512]": 0.00048828125,
+    "paged_attn[hq=16,hkv=2,hd=128,part=128]": 0.00048828125
+  },
+  "ops": [
+    {
+      "op": "fused_add_rms_norm",
+      "shape": "T=1,H=2048",
+      "torch_us": 133.1385612487793,
+      "kernel_us": 12.876960039138794,
+      "speedup": 10.33928511419715,
+      "kernel_GBs": 1.5904374897298892
+    },
+    {
+      "op": "fused_add_rms_norm",
+      "shape": "T=8,H=2048",
+      "torch_us": 140.64559936523438,
+      "kernel_us": 13.227839469909668,
+      "speedup": 10.632545071715693,
+      "kernel_GBs": 10.2184487729441
+    },
+    {
+      "op": "fused_add_rms_norm",
+      "shape": "T=32,H=2048",
+      "torch_us": 132.7342414855957,
+      "kernel_us": 12.612639665603638,
+      "speedup": 10.52390657346533,
+      "kernel_GBs": 41.89321299973185
+    },
+    {
+      "op": "fused_add_rms_norm",
+      "shape": "T=128,H=2048",
+      "torch_us": 165.8776092529297,
+      "kernel_us": 12.361279726028442,
+      "speedup": 13.419129162140928,
+      "kernel_GBs": 169.98628350554367
+    },
+    {
+      "op": "paged_decode_attention",
+      "shape": "B=1,ctx=512",
+      "torch_us": 440.88321685791016,
+      "kernel_p128_us": 132.64063835144043,
+      "kernel_p128_GBs": 3.9526950904055744,
+      "kernel_p512_us": 448.4096145629883,
+      "kernel_p512_GBs": 1.1692166781726154,
+      "kernel_us": 132.64063835144043,
+      "speedup": 3.3238924536065633,
+      "kernel_GBs": 3.9526950904055753,
+      "pct_of_T4_peak": 1.2352172157517423,
+      "split_k_p128_vs_p512": 3.3806352271533586
+    },
+    {
+      "op": "paged_decode_attention",
+      "shape": "B=1,ctx=2048",
+      "torch_us": 506.5523147583008,
+      "kernel_p128_us": 76.37760162353516,
+      "kernel_p128_GBs": 27.457683344612633,
+      "kernel_p512_us": 213.1430435180664,
+      "kernel_p512_GBs": 9.839176383076474,
+      "kernel_us": 76.37760162353516,
+      "speedup": 6.632210281426416,
+      "kernel_GBs": 27.457683344612636,
+      "pct_of_T4_peak": 8.580526045191448,
+      "split_k_p128_vs_p512": 2.7906485538606915
+    },
+    {
+      "op": "paged_decode_attention",
+      "shape": "B=8,ctx=1024",
+      "torch_us": 1246.6976165771484,
+      "kernel_p128_us": 211.0918426513672,
+      "kernel_p128_GBs": 39.7391386357566,
+      "kernel_p512_us": 312.72960662841797,
+      "kernel_p512_GBs": 26.823837021504826,
+      "kernel_us": 211.0918426513672,
+      "speedup": 5.9059488084348,
+      "kernel_GBs": 39.73913863575661,
+      "pct_of_T4_peak": 12.418480823673942,
+      "split_k_p128_vs_p512": 1.4814859859123624
+    },
+    {
+      "op": "paged_decode_attention",
+      "shape": "B=32,ctx=512",
+      "torch_us": 2415.1654052734375,
+      "kernel_p128_us": 369.23519134521484,
+      "kernel_p128_GBs": 45.437749145406386,
+      "kernel_p512_us": 561.3568115234375,
+      "kernel_p512_GBs": 29.88690197678224,
+      "kernel_us": 369.23519134521484,
+      "speedup": 6.540994634001148,
+      "kernel_GBs": 45.437749145406386,
+      "pct_of_T4_peak": 14.199296607939496,
+      "split_k_p128_vs_p512": 1.520323156301208
+    },
+    {
+      "op": "paged_decode_attention",
+      "shape": "B=32,ctx=1024",
+      "torch_us": 4586.9805908203125,
+      "kernel_p128_us": 688.853759765625,
+      "kernel_p128_GBs": 48.71053039097374,
+      "kernel_p512_us": 1106.618881225586,
+      "kernel_p512_GBs": 30.321579153645292,
+      "kernel_us": 688.853759765625,
+      "speedup": 6.658859773634657,
+      "kernel_GBs": 48.71053039097374,
+      "pct_of_T4_peak": 15.222040747179294,
+      "split_k_p128_vs_p512": 1.6064641667951425
+    },
+    {
+      "op": "paged_decode_attention",
+      "shape": "B=64,ctx=1024",
+      "torch_us": 9042.898559570312,
+      "kernel_p128_us": 1372.6002502441406,
+      "kernel_p128_GBs": 48.8917760200492,
+      "kernel_p512_us": 2024.9734497070312,
+      "kernel_p512_GBs": 33.14061426815703,
+      "kernel_us": 1372.6002502441406,
+      "speedup": 6.588151618041652,
+      "kernel_GBs": 48.89177602004919,
+      "pct_of_T4_peak": 15.278680006265372,
+      "split_k_p128_vs_p512": 1.4752827338818093
+    }
+  ],
+  "e2e": [
+    {
+      "batch": 1,
+      "prompt_len": 512,
+      "out_len": 256,
+      "decode_step_ms_torch": 24.45354200000338,
+      "decode_step_ms_kernels": 16.581486999996287,
+      "tpot_speedup": 1.4747496409706111,
+      "output_tok_s_torch": 40.89387132546531,
+      "output_tok_s_kernels": 60.30822205512835,
+      "greedy_outputs_identical_fraction": 1.0
+    },
+    {
+      "batch": 16,
+      "prompt_len": 512,
+      "out_len": 256,
+      "decode_step_ms_torch": 50.44453599998633,
+      "decode_step_ms_kernels": 20.17257500000369,
+      "tpot_speedup": 2.500649322160265,
+      "output_tok_s_torch": 317.18004106538586,
+      "output_tok_s_kernels": 793.1560546929221,
+      "greedy_outputs_identical_fraction": 1.0
+    },
+    {
+      "batch": 32,
+      "prompt_len": 512,
+      "out_len": 256,
+      "decode_step_ms_torch": 85.97199099995123,
+      "decode_step_ms_kernels": 30.07918849999669,
+      "tpot_speedup": 2.8581885113011176,
+      "output_tok_s_torch": 372.2142482429906,
+      "output_tok_s_kernels": 1063.8584880706978,
+      "greedy_outputs_identical_fraction": 1.0
+    },
+    {
+      "batch": 64,
+      "prompt_len": 512,
+      "out_len": 256,
+      "decode_step_ms_torch": 156.37684850003097,
+      "decode_step_ms_kernels": 44.84898550003891,
+      "tpot_speedup": 3.4867421583013356,
+      "output_tok_s_torch": 409.26774400359733,
+      "output_tok_s_kernels": 1427.0110970502215,
+      "greedy_outputs_identical_fraction": 1.0
+    }
+  ],
+  "gpu": "Tesla T4",
+  "note": "kernel_GBs for paged_decode_attention recomputed from kernel_us after a units bug in bench/kernel_bench.py (fixed)"
+}

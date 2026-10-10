@@ -66,3 +66,21 @@ def test_sampling_runs(hf_model):
     eng = make_engine(hf_model)
     seqs = eng.generate(random_prompts(3), SamplingParams(max_tokens=8, temperature=0.8, top_p=0.9, ignore_eos=True))
     assert all(s.num_output_tokens == 8 for s in seqs)
+
+
+def test_eos_handling_matches_hf():
+    """Regression (first T4 run): the oracle forced HF past EOS with min_new_tokens while the engine could pick
+    EOS, so 4/12 TinyLlama prompts 'diverged'. Engine and HF must agree when both stop at EOS."""
+    import torch
+    from conftest import make_hf_tiny_llama
+    hf = make_hf_tiny_llama(seed=0)
+    with torch.no_grad():                               # make EOS (id 2) win on some steps
+        hf.lm_head.weight[2] = hf.lm_head.weight[10:30].mean(0) * 6
+    prompts = random_prompts(10, seed=5)
+    eng = make_engine(hf)
+    got = [s.output_ids for s in eng.generate(prompts, SamplingParams(max_tokens=24))]
+    assert any(o and o[-1] == 2 for o in got), "test did not exercise EOS"
+    for p, g in zip(prompts, got):
+        e = hf.generate(torch.tensor([p]), max_new_tokens=24, do_sample=False, pad_token_id=0,
+                        eos_token_id=2)[0, len(p):].tolist()
+        assert g == e

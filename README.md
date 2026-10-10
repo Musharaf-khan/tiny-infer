@@ -4,7 +4,16 @@ A from-scratch LLM inference server: an iteration-level **continuous batching** 
 
 **The chain:** [cuda-kernel-lab](https://github.com/Musharaf-khan/cuda-kernel-lab) produced kernels that beat PyTorch ops in isolation. tiny-infer puts them inside a serving engine and measures what they change end to end, in tokens per second.
 
-**Model:** TinyLlama-1.1B-Chat, FP16. **GPU:** one NVIDIA T4 (Turing, sm_75, 320 GB/s, 15 GiB). **Code:** about 1,500 lines of engine Python and 480 lines of CUDA/C++, plus 1,600 lines of benchmarks and tests. **Correctness:** greedy output is token-identical to HuggingFace's in the test suite, on every code path, including the ones that preempt and recompute.
+**Headline (Tesla T4):**
+
+| Comparison | Result |
+|---|---|
+| vs a one-request-at-a-time server, 16 users | **16x the throughput** |
+| Paging vs contiguous KV allocation | **6.2x more concurrent users** in the same memory |
+| Project 1 kernels in the engine | **2.75x faster** at 64 users |
+| vs vLLM | **58–71% of vLLM's throughput**, with lower median TTFT |
+
+**Model:** TinyLlama-1.1B-Chat, FP16. **GPU:** one NVIDIA T4 (Turing, sm_75, 320 GB/s, 15 GiB). **Code:** about 1,500 lines of engine Python and 480 lines of CUDA/C++, plus 1,600 lines of benchmarks and tests. **Correctness:** greedy output is token-identical to HuggingFace's in the test suite, on every code path, including the ones that preempt and recompute. On the T4, output with the CUDA kernels is identical to output without them.
 
 ---
 
@@ -28,7 +37,11 @@ All numbers come from [`notebooks/t4_runbook.ipynb`](notebooks/t4_runbook.ipynb)
 | | 16 | 256.6 | 144 ms | 837 ms | 55.2 ms | 77% |
 | | 32 | 311.2 | 234 ms | 1.58 s | 94.7 ms | 83% |
 | | 64 | 340.9 | 420 ms | 3.27 s | 178.8 ms | 87% |
-| tiny-infer + Project 1 kernels | 1–64 | *rerun pending* | | | | |
+| **tiny-infer + Project 1 kernels** | 1 | **58.6** | 40 ms | 49 ms | 16.9 ms | 86% |
+| | 4 | **178.4** | 65 ms | 162 ms | 19.3 ms | 84% |
+| | 16 | **530.8** | 82 ms | 691 ms | 25.6 ms | 77% |
+| | 32 | **714.9** | 109 ms | 1.30 s | 38.4 ms | 74% |
+| | 64 | **938.9** | 180 ms | 2.63 s | 61.8 ms | 70% |
 | **vLLM 0.31.0** (`--dtype half`, prefix caching off) | 1 | 100.3 | 69 ms | 92 ms | 9.6 ms | 99% |
 | | 4 | 276.0 | 92 ms | 216 ms | 12.3 ms | 98% |
 | | 16 | 759.2 | 104 ms | 825 ms | 18.0 ms | 99% |
@@ -41,9 +54,10 @@ All numbers come from [`notebooks/t4_runbook.ipynb`](notebooks/t4_runbook.ipynb)
   - The naive server's throughput is flat at about 33 tok/s whatever the load. Its TTFT grows with queue depth instead, reaching a p99 of 77 s at 16 users. That is the Phase 2 collapse.
   - tiny-infer serves the same load at **3.2x the naive server's throughput at 4 users and 7.75x at 16 users**, with p50 TTFT staying under 150 ms.
   - Against an idealised HF static batch, where all requests arrive together and run offline, tiny-infer is **1.11x faster at 16 users and 1.23x at 32**. It also streams, and admits new requests every step instead of every batch.
-- **vs vLLM: tiny-infer reaches 26–38% of vLLM's throughput** (36% at 1 user, 34% at 16, 26% at 64).
-  - The gap is mostly in TPOT, which grows from 26 to 179 ms in tiny-infer but only from 10 to 43 ms in vLLM.
-  - The profile below shows why, and [docs/vllm_gap.md](docs/vllm_gap.md) breaks it down.
+- **The Project 1 kernels made the engine 1.6x faster at 1 user and 2.75x faster at 64 users.** They removed the K/V copying that the profiler showed was eating half of every decode step.
+- **vs vLLM: tiny-infer with kernels reaches 58–71% of vLLM's throughput** (58% at 1 user, 70% at 16, 71% at 64). Without the kernels it reached 26–38%.
+  - TTFT p50 is *lower* than vLLM's at every load measured (e.g. 82 ms vs 104 ms at 16 users, 180 ms vs 232 ms at 64).
+  - What remains of the gap is decode (TPOT 61.8 vs 43.1 ms at 64 users). [docs/vllm_gap.md](docs/vllm_gap.md) attributes it with profiler numbers.
 
 ![Throughput, TTFT and TPOT vs concurrency on a T4](results/serving.png)
 
@@ -72,20 +86,24 @@ The closed form predicted 23 sequences for contiguous allocation, which matched 
 
 ### Where a decode step goes (batch 32, `torch.profiler`)
 
-| Wall time | GPU busy | GPU idle (CPU-side) | Copy / gather | GEMM-class | Roofline floor |
-|---:|---:|---:|---:|---:|---:|
-| 79.5 ms | 65.7 ms | 13.8 ms | **31.6 ms** | 31.2 ms | 7.7 ms |
+| | Wall time | GPU busy | GPU idle (CPU-side) | Copy / gather | GEMM-class | Attention kernel | Roofline floor |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| PyTorch ops | 79.8 ms | 66.5 ms | 13.3 ms | **32.0 ms** | 31.6 ms | – | 7.7 ms |
+| **Project 1 kernels** | **29.2 ms** | 26.6 ms | 2.5 ms | **0.5 ms** | 11.9 ms | 13.2 ms | 7.7 ms |
 
-**Half of the GPU time is spent copying K/V.** The PyTorch decode-attention path gathers each sequence's K/V out of the block pool and `repeat_interleave`s it 8x for GQA before SDPA. That is exactly the traffic the Project 1 paged-attention kernel removes. The GEMM-class bucket also includes SDPA's batched matmuls, because sm_75 falls back to the math path.
+**Without the kernels, half the GPU time was copying K/V.** The PyTorch decode path gathers each sequence's K/V out of the block pool and `repeat_interleave`s it 8x for GQA before SDPA. SDPA then runs its math path on sm_75 (the GEMM-class bucket includes its batched matmuls). The paged-attention kernel reads K/V once through the block table and shares each row across the 8 query heads of a KV head. That leaves the decode step 2.7x shorter, at 26% of the bandwidth roofline (up from 9.6%).
 
 ### Project 1 kernels in the decode path
 
-| Kernel | Replaces | Op speedup | Decode-step (TPOT) speedup @ batch 32 |
-|---|---|---:|---:|
-| fused residual-add + RMSNorm (FP16) | `x + residual` then HF `LlamaRMSNorm` (a chain of ~8 small kernels) | *rerun pending* | *rerun pending* |
-| GQA paged decode attention (split-K) | gather-from-blocks + `repeat_interleave` + SDPA | *rerun pending* | *rerun pending* |
+| Kernel | Replaces | Op speedup (T4) | End-to-end |
+|---|---|---:|---|
+| fused residual-add + RMSNorm (FP16) | `x + residual` then HF `LlamaRMSNorm` (a chain of ~8 small kernels) | **10.3–13.4x** (133 → 13 µs at batch 32) | – |
+| GQA paged decode attention (Flash-Decoding split-K) | gather-from-blocks + `repeat_interleave` + SDPA | **3.3–6.7x** (4.59 → 0.69 ms at 32 seqs × 1,024 ctx) | – |
+| **both, in the engine** | | | decode step **1.47x / 2.50x / 2.86x / 3.49x** faster at batch 1 / 16 / 32 / 64; greedy output identical with and without kernels at every batch size |
 
-The first T4 run did not produce kernel numbers. A bug in the kernel **self-test harness** (its block pool was smaller than its block tables) stopped the engine at startup. The fix is in, and a regression test now covers it. [`notebooks/t4_kernels_rerun.ipynb`](notebooks/t4_kernels_rerun.ipynb) re-runs only the kernel steps.
+- **The RMSNorm speedup is launch overhead, not bandwidth.** At decode shapes a call moves only 16–512 KB, and one launch replaces about 9.
+- **The attention speedup grows with batch × context,** because that's what the gather path copies. Its end-to-end effect therefore grows with load.
+- **The attention kernel is now the largest item at batch 64** (25.7 of 39.4 GPU-ms). It reaches 49 GB/s, which is 15% of the T4's 320 GB/s. 128-token partitions beat 512-token ones in every measured shape (1.4–3.4x), but the engine still uses 512 because 128 hasn't been measured end to end yet. That is the next step.
 
 Write-up: [docs/kernels.md](docs/kernels.md). Gap to vLLM, with a profiler breakdown: [docs/vllm_gap.md](docs/vllm_gap.md).
 
@@ -185,7 +203,7 @@ Useful server flags:
 ## Tests
 
 ```bash
-python -m pytest tests -q      # 28 tests, CPU, ~30 s
+python -m pytest tests -q      # 29 tests, CPU, ~15 s
 ```
 
 The tests build a small random Llama (GQA, RoPE, RMSNorm, SwiGLU) and require **token-identical** greedy output against HF `generate()` under all of these configurations:
@@ -200,7 +218,12 @@ The tests build a small random Llama (GQA, RoPE, RMSNorm, SwiGLU) and require **
 - forced recompute-preemption
 - prefix-cache hits
 
-The other tests cover block-manager invariants and scheduler policy, plus real HTTP/SSE streaming with concurrent clients. The CUDA kernels self-test against the PyTorch reference every time the engine starts with `--custom-kernels`. The engine refuses to serve if any kernel disagrees.
+The other tests cover block-manager invariants and scheduler policy, plus real HTTP/SSE streaming with concurrent clients. **Real-model oracle (TinyLlama on the T4):** `scripts/check_correctness.py` compares 12 prompts against HF `generate()`.
+- **First run: flawed check.** The check passed `min_new_tokens` to HF, which hides EOS, while the engine was free to pick it. As a result, 4 of 12 prompts "diverged" at the same positions in FP32, FP16 and FP16 with kernels.
+- **Fix:** both sides now stop at EOS naturally. A CPU regression test reproduces the original failure and passes after the fix.
+- **Pending:** the fixed check has not yet been re-run on the T4.
+
+The CUDA kernels self-test against the PyTorch reference every time the engine starts with `--custom-kernels`. The engine refuses to serve if any kernel disagrees.
 
 ## Honest scope
 

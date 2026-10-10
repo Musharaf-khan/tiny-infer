@@ -65,8 +65,9 @@ def op_bench():
             k = cuda_time(lambda: ops.paged_decode_attention(q, kc, vc, bt, lens, hd ** -0.5, ctx, True, ps), iters=50)
             row[f"kernel_p{ps}_us"] = k * 1e3
             row[f"kernel_p{ps}_GBs"] = kv_bytes / k / 1e6
-        best = min(row["kernel_p128_us"], row["kernel_p512_us"])
-        row.update(kernel_us=best, speedup=row["torch_us"] / best, kernel_GBs=kv_bytes / best / 1e6, pct_of_T4_peak=kv_bytes / best / 1e6 / T4_GBS * 100)
+        best = min(row["kernel_p128_us"], row["kernel_p512_us"])          # microseconds
+        gbs = kv_bytes / (best * 1e-6) / 1e9
+        row.update(kernel_us=best, speedup=row["torch_us"] / best, kernel_GBs=gbs, pct_of_T4_peak=gbs / T4_GBS * 100)
         rows.append(row)
     return rows
 

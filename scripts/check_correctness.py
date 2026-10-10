@@ -58,7 +58,9 @@ def main():
     with torch.inference_mode():
         for prompt in PROMPTS:
             ids = tok(prompt, return_tensors="pt").input_ids.cuda()
-            out = hf.generate(ids, max_new_tokens=a.max_new, min_new_tokens=a.max_new, do_sample=False,
+            # No min_new_tokens: it makes HF mask EOS, while the engine is free to pick it. Both sides stop at
+            # EOS naturally instead (the first T4 run diverged on 4/12 prompts exactly where EOS won).
+            out = hf.generate(ids, max_new_tokens=a.max_new, do_sample=False, eos_token_id=tok.eos_token_id,
                               output_scores=True, return_dict_in_generate=True, pad_token_id=tok.eos_token_id)
             expected.append(out.sequences[0, ids.shape[1]:].tolist())
             scores.append([s[0].float() for s in out.scores])
@@ -69,7 +71,7 @@ def main():
     cfg = EngineConfig(model=a.model, dtype=a.dtype, kv_cache_gb=2.0, use_custom_kernels=a.custom_kernels,
                        max_num_batched_tokens=64)          # small budget: exercises chunked prefill too
     eng = LLMEngine(cfg, model=model, tokenizer=tok)
-    seqs = eng.generate(PROMPTS, SamplingParams(max_tokens=a.max_new, ignore_eos=True))
+    seqs = eng.generate(PROMPTS, SamplingParams(max_tokens=a.max_new))
 
     exact, bad, divergences = 0, 0, []
     for i, (s, e) in enumerate(zip(seqs, expected)):
@@ -77,22 +79,29 @@ def main():
         if got == e:
             exact += 1
             continue
-        j = next(k for k in range(len(e)) if got[k] != e[k])
+        j = next((k for k in range(min(len(e), len(got))) if got[k] != e[k]), min(len(e), len(got)))
+        if j >= len(scores[i]):                       # one side stopped early with an identical prefix
+            bad += 1
+            divergences.append({"prompt": i, "token": j, "top2_gap": None, "near_tie": False,
+                                "note": f"length mismatch hf={len(e)} engine={len(got)}"})
+            print(f"prompt {i}: same prefix but lengths differ (hf {len(e)}, engine {len(got)}): REAL MISMATCH")
+            continue
         top2 = scores[i][j].topk(2).values
         gap = float(top2[0] - top2[1])
         # fp32: only an exact tie may flip (cuBLAS picks different tiles for batch 1 vs batch N)
         near_tie = gap <= (a.margin if a.dtype == "float16" else 1e-3)
         bad += 0 if near_tie else 1
-        divergences.append({"prompt": i, "token": j, "top2_gap": gap, "near_tie": near_tie})
+        divergences.append({"prompt": i, "token": j, "top2_gap": gap, "near_tie": near_tie,
+                            "hf_token": e[j], "engine_token": got[j]})
         print(f"prompt {i}: diverges at token {j}; HF top-2 logit gap there = {gap:.3f} "
               f"({'near-tie: fp16 rounding' if near_tie else 'REAL MISMATCH'})")
     print(f"\n{exact}/{len(PROMPTS)} prompts token-identical to HF ({a.dtype}, "
-          f"kernels={'on' if a.custom_kernels else 'off'}, {a.max_new} tokens each)")
+          f"kernels={'on' if a.custom_kernels else 'off'}, up to {a.max_new} tokens each, both stopping at EOS)")
     import json
     os.makedirs("results", exist_ok=True)
     out = f"results/correctness_{a.dtype}{'_kernels' if a.custom_kernels else ''}.json"
     json.dump({"dtype": a.dtype, "custom_kernels": a.custom_kernels, "prompts": len(PROMPTS),
-               "tokens_per_prompt": a.max_new, "identical": exact, "divergences": divergences,
+               "tokens_per_prompt": a.max_new, "hf_tokens_total": sum(len(e) for e in expected), "identical": exact, "divergences": divergences,
                "pass": bad == 0}, open(out, "w"), indent=2)
     if bad:
         print("FAIL")

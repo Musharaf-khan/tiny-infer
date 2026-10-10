@@ -1,12 +1,12 @@
 # Launch kit: resume bullets, LinkedIn post, demo recording
 
-Replace every `[X]` with a number from `results/REPORT.md`. Do not ship a bullet whose number you haven't measured.
+Every number below comes from `results/` (Tesla T4 runs).
 
-## Resume bullets (pick 2-3)
+## Resume bullets (measured on a Tesla T4; pick 2-3)
 
-- Built **tiny-infer**, a from-scratch LLM inference server with iteration-level continuous batching, a paged KV cache with prefix caching, and an OpenAI-compatible streaming API. It serves TinyLlama-1.1B at **[X] tok/s** on a single T4, **[X]x** a sequential HF `generate()` server at 32 concurrent users, with greedy output verified token-identical to HuggingFace.
-- Designed a paged KV block manager (16-token blocks, ref-counted prefix sharing, LRU eviction, recompute preemption). It ran **[X]x** more concurrent sequences than contiguous allocation in the same 1 GiB pool, cutting KV waste from **[X]%** to **[X]%**.
-- Integrated my own CUDA kernels (fused residual-add + RMSNorm; a GQA-aware paged decode-attention kernel with Flash-Decoding split-K) into the decode path as PyTorch custom ops, for a **[X]%** decode-step (TPOT) reduction at batch 32. Benchmarked against vLLM (**[X]%** of its throughput) and attributed the gap with a profiler breakdown (CUDA graphs, fusion depth, CPU/GPU overlap).
+- Built **tiny-infer**, a from-scratch LLM inference server with an iteration-level continuous-batching scheduler, a paged KV cache with prefix caching, and an OpenAI-compatible streaming API. On a single T4 it serves TinyLlama-1.1B at **up to 939 tok/s** (64 users), **16x a sequential HF server** at 16 users, and reaches **58–71% of vLLM's throughput**, with lower median time-to-first-token.
+- Designed a paged KV block manager (16-token blocks, ref-counted prefix sharing, LRU eviction, recompute preemption). It fit **6.2x more concurrent sequences** than contiguous allocation in the same 1 GiB pool, cut KV waste from **79.7% to 1.5%**, and prefix caching lowered **p99 TTFT 3.8x** on shared-system-prompt traffic.
+- Profiled the decode step, found **half of GPU time going to K/V gather/copy**, and replaced it with my own CUDA kernels (GQA-aware paged decode attention with Flash-Decoding split-K, and fused residual-add + RMSNorm) registered as PyTorch custom ops. That cut a batch-32 decode step from **80 to 29 ms**, raised serving throughput **2.75x at 64 users**, and left greedy output unchanged.
 
 ## LinkedIn post
 
@@ -14,17 +14,15 @@ Replace every `[X]` with a number from `results/REPORT.md`. Do not ship a bullet
 >
 > Last project, I wrote 25 CUDA kernels and got SGEMM to cuBLAS parity on a T4. The question I couldn't answer was: does any of it matter once there's a real serving system around it?
 >
-> So I built tiny-infer: continuous batching, a paged KV cache, prefix caching, and a streaming OpenAI-compatible API. My fused RMSNorm and a new paged decode-attention kernel run in the decode path.
+> So I built tiny-infer: continuous batching, a paged KV cache, prefix caching, and a streaming OpenAI-compatible API, all from scratch in Python + CUDA.
 >
 > On one T4 with TinyLlama-1.1B:
-> • [X]x the throughput of a one-request-at-a-time server at 32 users
-> • [X]x more concurrent users from paging alone (same memory)
-> • my kernels: [X]% faster per decode step
-> • vLLM is still [X]x faster than me, and the README explains exactly why (CUDA graphs, launch overhead, fusion), with a profiler breakdown
+> • 16x the throughput of a one-request-at-a-time server at 16 users
+> • 6.2x more users in the same memory, just from paging (KV waste 80% → 1.5%)
+> • the profiler showed half of every decode step was copying the KV cache, so I wrote a paged-attention kernel to kill it: 80 ms → 29 ms per step, 2.75x throughput at 64 users
+> • vLLM is still faster: I'm at 58–71% of it. The README breaks down exactly where the rest goes (CUDA graphs, an attention kernel at 15% of bandwidth, single-process serving).
 >
-> Every output is checked token-for-token against HuggingFace.
->
-> The best lesson: decode is a memory-bandwidth problem. Batching works because the weights are read once per step whether you serve 1 user or 64.
+> The best lesson: decode is a memory-bandwidth problem. Batching works because the weights are read once per step whether you serve 1 user or 64. And my biggest speedup came from deleting a copy, not from clever math.
 >
 > Code + benchmarks: github.com/Musharaf-khan/tiny-infer
 > #CUDA #LLM #inference #vLLM #GPU

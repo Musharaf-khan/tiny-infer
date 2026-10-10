@@ -2,7 +2,7 @@
 
 Two kernels from [cuda-kernel-lab](https://github.com/Musharaf-khan/cuda-kernel-lab) were adapted for the decode path of a real serving engine. They are registered as PyTorch custom ops (`torch.ops.tiny_infer.*`) and measured both in isolation and end to end.
 
-> Numbers marked `—` are filled in from `results/kernel_bench.json` after the T4 run (runbook step 11).
+> Measured on a Tesla T4 (`results/kernel_bench.json`, `results/step_profile_*.json`). Every kernel passed the startup self-test against its PyTorch reference (worst max |error| 2.0e-3 in FP16).
 
 ## Kernel 1: fused residual-add + RMSNorm (FP16)
 
@@ -37,9 +37,12 @@ The decode shapes are a catch: T = batch size rows (1-64) × 2,048 → only 4-25
 
 | Shape (T × 2,048) | PyTorch | Kernel | Speedup | GB/s |
 |---|---:|---:|---:|---:|
-| 1 | — | — | — | — |
-| 32 | — | — | — | — |
-| 128 | — | — | — | — |
+| 1 | 133.1 µs | 12.9 µs | **10.3x** | 1.6 |
+| 8 | 140.7 µs | 13.2 µs | 10.6x | 10.2 |
+| 32 | 132.7 µs | 12.6 µs | 10.5x | 41.9 |
+| 128 | 165.9 µs | 12.4 µs | **13.4x** | 170.0 |
+
+The PyTorch time is flat at about 133 µs from 1 to 32 rows: it is all launch overhead from roughly 9 small kernels. The kernel is flat at about 13 µs: a single launch whose data fits in one wave. Only at 128 rows does bandwidth start to show, at 170 GB/s (53% of peak).
 
 ## Kernel 2: GQA-aware paged decode attention (split-K)
 
@@ -67,9 +70,30 @@ Compiled for sm_75: 46-64 registers, **0 spills**, 24 KB of shared memory for G 
 
 | Batch × context | PyTorch (gather+SDPA) | Kernel | Speedup | Kernel GB/s (KV bytes) |
 |---|---:|---:|---:|---:|
-| 1 × 2,048 | — | — | — | — |
-| 32 × 1,024 | — | — | — | — |
-| 64 × 1,024 | — | — | — | — |
+| 1 × 512 | 441 µs | 133 µs | 3.3x | 4.0 |
+| 1 × 2,048 | 507 µs | 76 µs | **6.6x** | 27.5 |
+| 8 × 1,024 | 1,247 µs | 211 µs | 5.9x | 39.7 |
+| 32 × 512 | 2,415 µs | 369 µs | 6.5x | 45.4 |
+| 32 × 1,024 | 4,587 µs | 689 µs | **6.7x** | 48.7 |
+| 64 × 1,024 | 9,043 µs | 1,373 µs | 6.6x | 48.9 |
+
+"Kernel" is the faster partition size, which was 128 tokens in every shape.
+
+**The split-K (Flash-Decoding) effect, measured.** Cutting the context into 128-token partitions instead of 512-token ones made the kernel faster in every shape. The gain is largest when there is least parallelism:
+
+| Shape | 512-token partitions | 128-token partitions |
+|---|---:|---:|
+| 1 × 512 | 448 µs | 133 µs (3.4x) |
+| 1 × 2,048 | 213 µs | 76 µs (2.8x) |
+| 64 × 1,024 | 2,025 µs | 1,373 µs (1.5x) |
+
+At batch 1 the grid is only (1 sequence × 4 KV heads × partitions) blocks, so smaller partitions mean more of the 40 SMs get work.
+
+**The honest part.** 49 GB/s is 15% of the T4's 320 GB/s, so the kernel is not yet bandwidth-bound. Two likely reasons:
+- each 4-warp block streams its partition one 128-byte row per warp at a time, with little memory-level parallelism per SM;
+- the softmax runs 8 block-wide reductions, one per query head.
+
+The engine currently calls the kernel with 512-token partitions; switching to 128 is the measured next step.
 
 ## End to end
 
@@ -77,17 +101,46 @@ The decode-step time at a fixed decode batch, with kernels off vs on, is TPOT un
 
 | Decode batch | PyTorch ops | Project 1 kernels | TPOT speedup |
 |---:|---:|---:|---:|
-| 1 | — | — | — |
-| 32 | — | — | — |
-| 64 | — | — | — |
+| 1 | 24.45 ms | 16.58 ms | **1.47x** |
+| 16 | 50.44 ms | 20.17 ms | **2.50x** |
+| 32 | 85.97 ms | 30.08 ms | **2.86x** |
+| 64 | 156.38 ms | 44.85 ms | **3.49x** |
 
-**Why the end-to-end gain is smaller than the op-level gain (Amdahl).** At decode, most of the GPU time should be the weight-reading GEMMs (the step profile gives the measured share), which are untouched here; cuBLAS already runs them near the bandwidth roofline. The kernels can only shrink the remaining share:
+In this run (512-token prompts, 256 output tokens, interleaved off/on/off/on), greedy output was **identical with and without the kernels in 100% of sequences** at every batch size.
 
-- norms;
-- attention, which grows with batch × context, so the attention kernel matters more at large batch and long context;
-- the gather copies the attention kernel removes.
+The same kernels in the serving sweep (HTTP, mixed lengths):
 
-`bench/step_profile.py` measures each share directly.
+| Users | Output tok/s, PyTorch ops | Output tok/s, kernels | Gain |
+|---:|---:|---:|---:|
+| 1 | 36.4 | 58.6 | 1.61x |
+| 4 | 106.3 | 178.4 | 1.68x |
+| 16 | 256.6 | 530.8 | 2.07x |
+| 32 | 311.2 | 714.9 | 2.30x |
+| 64 | 340.9 | 938.9 | **2.75x** |
+
+**Profiler view of one batch-32 decode step:**
+
+| Component | PyTorch ops | Kernels |
+|---|---:|---:|
+| Wall time | 79.8 ms | 29.2 ms |
+| copy/gather | 32.0 ms | 0.5 ms |
+| GEMM-class | 31.6 ms | 11.9 ms |
+| attention | – | 13.2 ms |
+| norms | in "other" | 0.17 ms |
+| GPU idle | 13.3 ms | 2.5 ms |
+
+GPU idle shrank too, because the step now launches far fewer kernels.
+
+**Why the end-to-end gain (1.5–3.5x) is smaller than the op-level gain (up to 13x): Amdahl.**
+
+After the kernels, the batch-32 decode step is 26.6 GPU-ms:
+- 11.9 ms of weight GEMMs, which the kernels don't touch. 2.05 GB of weights in 11.9 ms is 172 GB/s, 54% of peak.
+- 13.2 ms of attention.
+- about 1.5 ms of everything else.
+
+The norm kernel's 10x applies to a share that was already small. The attention kernel's 6.6x applies to the largest share. Before the kernels, that share was copying plus SDPA's math-path matmuls, which made up most of the 66.5 GPU-ms.
+
+This is also why the end-to-end gain grows with batch: the attention share grows with batch × context, while the weight-GEMM share stays almost flat.
 
 ## What I'd change next
 

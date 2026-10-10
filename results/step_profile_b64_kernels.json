@@ -1,0 +1,16 @@
+{
+  "batch": 64,
+  "custom_kernels": true,
+  "wall_step_ms": 43.47165260000452,
+  "gpu_busy_ms": 39.36104070000002,
+  "gpu_idle_ms (CPU/launch overhead)": 4.1106119000045,
+  "roofline_floor_ms": 8.8401408,
+  "pct_of_roofline": 20.335414623733634,
+  "breakdown_ms": {
+    "attention": 25.65193470000001,
+    "gemm": 11.976091000000032,
+    "elementwise/other": 0.9757571999999501,
+    "copy/gather": 0.5644547000000565,
+    "norm": 0.19280309999997075
+  }
+}

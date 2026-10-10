@@ -1,71 +1,65 @@
 # Why tiny-infer is slower than vLLM, and what would close the gap
 
-Measured on a Tesla T4 with vLLM 0.31.0 (`--dtype half`, prefix caching off). Same harness and workload for both systems.
+Measured on a Tesla T4 with vLLM 0.31.0 (`--dtype half`, prefix caching off). Both systems ran the same harness, workload and concurrency levels. Raw data: `results/serving.jsonl` and `results/step_profile_*.json`.
 
 ## The ratio
 
-| Concurrency | tiny-infer out tok/s | vLLM out tok/s | tiny-infer / vLLM | tiny-infer TPOT | vLLM TPOT |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 36.4 | 100.3 | 36% | 26.5 ms | 9.6 ms |
-| 4 | 106.3 | 276.0 | 38% | 32.7 ms | 12.3 ms |
-| 16 | 256.6 | 759.2 | 34% | 55.2 ms | 18.0 ms |
-| 32 | 311.2 | 1,018.9 | 31% | 94.7 ms | 27.1 ms |
-| 64 | 340.9 | 1,331.1 | 26% | 178.8 ms | 43.1 ms |
+| Users | tiny-infer, PyTorch ops | tiny-infer + kernels | vLLM | **kernels / vLLM** | TPOT p50: kernels vs vLLM | TTFT p50: kernels vs vLLM |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 36.4 | 58.6 | 100.3 | **58%** | 16.9 vs 9.6 ms | 40 vs 69 ms |
+| 4 | 106.3 | 178.4 | 276.0 | **65%** | 19.3 vs 12.3 ms | 65 vs 92 ms |
+| 16 | 256.6 | 530.8 | 759.2 | **70%** | 25.6 vs 18.0 ms | 82 vs 104 ms |
+| 32 | 311.2 | 714.9 | 1,018.9 | **70%** | 38.4 vs 27.1 ms | 109 vs 135 ms |
+| 64 | 340.9 | 938.9 | 1,331.1 | **71%** | 61.8 vs 43.1 ms | 180 vs 232 ms |
 
-TTFT is close: at p50 tiny-infer is within about 1.5–2x of vLLM at every load, and it is faster at 1 user (43 ms vs 69 ms). **The gap is almost entirely decode, and it widens with batch size.** That pattern points to a per-sequence cost in the decode step, not a fixed one.
+Throughput is in output tok/s.
 
-## Where a decode step goes (batch 32, T4, PyTorch ops)
+- **Before the kernels: 26–38% of vLLM. After: 58–71%.**
+- tiny-infer's TTFT is lower than vLLM's at every load, at both p50 and p99 (p99 at 64 users: 2.63 s vs 2.95 s). A likely cause, not yet isolated: decode-first scheduling with a 2,048-token budget admits new prompts quickly.
+- **The whole remaining gap is decode (TPOT).** tiny-infer's TPOT is 1.76x vLLM's at 1 user and about 1.42x from 16 users up.
 
-| Component | ms / step | Notes |
-|---|---:|---|
-| Wall time per step | 79.5 | vLLM's TPOT at 32 users is 27.1 ms |
-| GPU busy | 65.7 | |
-| → copy / gather | **31.6** | gather of K/V out of the block pool + 8x `repeat_interleave` for GQA, every layer |
-| → GEMM-class | 31.2 | weight GEMMs **plus** SDPA's batched matmuls (sm_75 has no FlashAttention, so SDPA uses its math path) |
-| → elementwise / other | 2.8 | RoPE, SiLU·mul, residual adds |
-| GPU idle (CPU-side: Python scheduling, input building, launches) | 13.8 | |
-| Roofline floor (weights + KV ÷ 320 GB/s) | 7.7 | tiny-infer runs at 9.6% of it |
+## Step 1: the gap that the kernels closed
 
-Here is what this predicts for the kernel rerun:
+Batch-32 decode step, `torch.profiler`, offline engine:
 
-- The paged-attention kernel reads K/V once through the block table, so it should remove most of the 31.6 ms copy bucket and the attention part of the GEMM-class bucket.
-- At batch 64 and about 600 tokens of context, the PyTorch path materialises roughly 0.3 GB of K/V copies per layer before attention. The kernel reads about 0.04 GB (64 × 600 × 4 KV heads × 64 × 2 bytes × K and V).
+| Component | PyTorch ops | Project 1 kernels |
+|---|---:|---:|
+| Wall time per step | 79.8 ms | **29.2 ms** |
+| GPU busy | 66.5 | 26.6 |
+| → copy/gather (K/V out of the block pool + 8x GQA repeat) | **32.0** | **0.5** |
+| → GEMM-class (weights + SDPA math-path matmuls) | 31.6 | 11.9 (weights only) |
+| → attention kernel | – | 13.2 |
+| → norms + elementwise | 2.9 | 1.0 |
+| GPU idle (CPU-side) | 13.3 | 2.5 |
+| Roofline floor (weights + KV ÷ 320 GB/s) | 7.7 | 7.7 |
+| % of roofline | 9.6% | 26% |
 
-## The mechanisms, largest expected effect first
+This was the largest single gap to vLLM. vLLM never materialises a dense K/V copy, and now tiny-infer doesn't either.
 
-The step profile above is the evidence for each claim below. Where a row is small, the matching claim is downgraded.
+## Step 2: what is left, largest first
 
-0. **Decode attention through gather + repeat (measured: 31.6 of 65.7 GPU-ms at batch 32).** This is the largest single item, and it is the one Phase 5's kernel targets. vLLM reads paged K/V in-kernel and never materialises a dense copy.
-1. **CUDA graphs: the decode step is launch-bound at small batch.**
-   - One TinyLlama decode step in tiny-infer is about 15 kernel launches per layer × 22 layers, around 300 launches in all.
-   - With the CPU overhead of each eager PyTorch launch, that can rival the 6.9 ms weight-read floor itself.
-   - vLLM captures each decode batch size as a CUDA graph and replays it with a single launch.
-   - *Measured as:* the "GPU idle" row. This is also why tiny-infer's batch-1 TPOT is furthest from vLLM's.
-2. **Kernel fusion depth.** vLLM fuses:
-   - RoPE with the K/V cache write (`reshape_and_cache`);
-   - SiLU·mul;
-   - residual-add + RMSNorm (as tiny-infer now does);
-   - and, through `torch.compile`, much of the remaining elementwise glue.
+1. **Small-batch launch overhead → CUDA graphs.**
+   - At batch 1 the offline decode step takes 16.6 ms; the weight-read floor is 6.9 ms and vLLM's TPOT is 9.6 ms.
+   - A tiny-infer step still launches roughly 15 kernels per layer, about 300 in all, each from eager PyTorch. vLLM captures each decode batch size as a CUDA graph and replays it with one launch.
+   - This is the most likely explanation for the batch-1 gap. It isn't yet isolated with a batch-1 profile, which is the next measurement to take.
+2. **The attention kernel at 15% of bandwidth.** At batch 64, attention is 25.7 of 39.4 GPU-ms, and the kernel moves 49 GB/s against 320 available. Measured headroom already exists: 128-token partitions beat the engine's current 512 by 1.5x at 64 × 1,024. Beyond that, the kernel needs more bytes in flight per SM (wider loads, more warps per partition).
+3. **Serving-stack overhead.** At 64 users the offline engine's decode step is 44.9 ms, but the served TPOT is 61.8 ms. Two things account for the difference:
+   - Prefills of arriving requests are interleaved into decode steps (closed-loop clients keep sending new prompts).
+   - Detokenisation and HTTP work run in the same Python process as the engine thread and share its GIL.
 
-   tiny-infer still runs RoPE as about 6 elementwise kernels, `index_copy_` twice per layer, and SiLU and mul separately. *Measured as:* the "copies/elementwise" row.
-3. **CPU/GPU overlap.** tiny-infer builds the next step's inputs only after `.tolist()` has synchronised on the sampled tokens, so the GPU idles while Python schedules. vLLM overlaps the two:
-   - API server and detokenisation in separate processes;
-   - a persistent batch with incremental input updates;
-   - async scheduling.
-4. **Attention kernels for prefill.** tiny-infer's chunked prefill over a cached context gathers K/V and runs SDPA with a mask. vLLM's paged prefill kernels read the block table directly. This matters for TTFT under prefix hits and long chunked prompts. It matters little for decode throughput.
-5. **Scheduler sophistication.** These policies affect tail latency more than steady-state throughput:
-   - vLLM's token budget, priority between prefill and decode, preemption, and admission were tuned on real traces;
-   - tiny-infer uses FCFS with decode first, recompute preemption, and a fixed 2,048-token budget.
+   vLLM puts the API server, the detokeniser and the engine core in separate processes.
+4. **Fusion depth.** RoPE is still about 6 elementwise kernels plus two `index_copy_` cache writes per layer, and SiLU and mul are separate. vLLM fuses RoPE with the cache write and SiLU·mul. After the kernels this is about 1 ms per step, so it is small on its own; it also shrinks item 1's launch count.
+5. **Weight GEMMs at 54% of bandwidth** (2.05 GB in 11.9 ms). These are cuBLAS FP16 GEMMs with M = batch on sm_75. vLLM uses the same cuBLAS for these on a T4, so this part is not a vLLM advantage. It is the floor both systems share.
 
-## What would close it (and expected size)
+## What would close it
 
-| Change | Closes | Effort |
-|---|---|---|
-| CUDA-graph the decode step per batch bucket (static input buffers, graph replay) | most of "GPU idle" at small batch | medium: needs fixed-address inputs and padded batch sizes |
-| Fused RoPE + cache write; fused SiLU·mul | most of the elementwise row | small: two short kernels |
-| Overlap: build step N+1 inputs while step N runs; move detokenisation out of the event loop | the CPU share at large batch | medium |
-| `torch.compile` the layer body | some of 1 and 2 at once | small to try, flaky to debug |
+| Change | Targets | Evidence it matters | Effort |
+|---|---|---|---|
+| 128-token attention partitions (one-line default change) | item 2 | op-level 1.4–3.4x faster than 512 in every shape | trivial; needs an end-to-end rerun |
+| CUDA-graph the decode step per batch bucket | item 1 | batch-1 step 16.6 ms vs 6.9 ms floor | medium: static input buffers, padded batch sizes |
+| Engine in its own process; detokenise off the event loop | item 3 | 44.9 ms offline vs 61.8 ms served at batch 64 | medium |
+| Fused RoPE + cache write, fused SiLU·mul | item 4 (+ fewer launches for item 1) | ~1 ms/step, plus fewer launches | small |
 
 ## The one-sentence version (for interviews)
 
-"My engine reaches 26–38% of vLLM's throughput on a T4, and the gap is almost all decode. The profiler showed half of each decode step's GPU time going to copying K/V out of the paged cache and repeating it for GQA, which my paged-attention kernel removes. What's left is launch overhead at small batch (14 ms of GPU idle per step, which CUDA graphs fix) and fusion depth."
+"Out of the box my engine reached 26–38% of vLLM on a T4. The profiler showed half of every decode step was copying K/V out of the paged cache and repeating it for GQA. My paged-attention kernel removed that, which took the engine to 58–71% of vLLM and cut a batch-32 decode step from 80 to 29 ms. What's left is decode-only: launch overhead at small batch, which CUDA graphs fix; an attention kernel still at 15% of bandwidth; and serving-stack overhead from running everything in one Python process."
