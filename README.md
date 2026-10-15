@@ -151,7 +151,7 @@ loop forever:                                       # tiny_infer/scheduler.py
     run ONE forward pass over all scheduled tokens; sample; append; retire finished seqs at once
 ```
 
-Design notes, with every decision and the reason for it: [docs/design.md](docs/design.md).
+Design notes, with every decision and the reason for it: [docs/design.md](docs/design.md). Complete project brief (every component, every measured number with its source, and what not to claim): [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md).
 
 ## Quickstart
 
