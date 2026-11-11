@@ -99,7 +99,7 @@ def fused_add_rms_norm(x, residual, w, eps, use_custom=False):
 
 
 def paged_decode_attention(q, k_cache, v_cache, block_tables, context_lens, scale, max_context_len,
-                           use_custom=False, partition_size: int = 512):
+                           use_custom=False, partition_size: int = 128):
     if _use_kernel(use_custom, q, k_cache, v_cache):
         q = q.contiguous()
         out = torch.empty_like(q)

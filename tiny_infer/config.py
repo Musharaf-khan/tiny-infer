@@ -82,6 +82,9 @@ class EngineConfig:
     enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = False
     use_custom_kernels: bool = False      # Project 1 CUDA kernels in the decode path
+    attention_partition_size: int = 128   # paged-attention split-K partition, in tokens; the kernel
+                                          # bench measured 128 as 1.48-3.38x faster than 512 in every
+                                          # shape (docs/kernels.md). Use 512 to switch back.
     fuse_weights: bool = True             # concat q/k/v and gate/up into single GEMMs
     seed: int = 0
     extra: dict = field(default_factory=dict)

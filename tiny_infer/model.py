@@ -53,9 +53,11 @@ class KVCache:
 
 class LlamaModel:
     def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor], device: torch.device,
-                 dtype: torch.dtype, fuse_weights: bool = True, use_custom_kernels: bool = False):
+                 dtype: torch.dtype, fuse_weights: bool = True, use_custom_kernels: bool = False,
+                 attention_partition_size: int = 128):
         self.cfg, self.device, self.dtype = cfg, device, dtype
         self.use_custom_kernels = use_custom_kernels
+        self.attention_partition_size = attention_partition_size
         self.fuse = fuse_weights
         w = {k: v.to(device=device, dtype=dtype).contiguous() for k, v in weights.items()}
         self.embed = w["model.embed_tokens.weight"]
@@ -128,7 +130,7 @@ class LlamaModel:
         if nd:
             out[:nd] = ops.paged_decode_attention(
                 q[:nd], kv.k[layer], kv.v[layer], md.decode_block_tables, md.decode_context_lens,
-                self.scale, md.max_decode_context, self.use_custom_kernels)
+                self.scale, md.max_decode_context, self.use_custom_kernels, self.attention_partition_size)
         groups = cfg.num_heads // cfg.num_kv_heads
         bs = kv.block_size
         for start, n, ctx, table in md.prefills:

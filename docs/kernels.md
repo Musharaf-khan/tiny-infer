@@ -58,7 +58,7 @@ The PyTorch time is flat at about 133 µs from 1 to 32 rows: it is dominated by 
 
 1. **GQA-shared loads.** TinyLlama has 32 query heads over 4 KV heads, so G = 8. One block handles one KV head and all 8 of its query heads, so each K/V row is read once and used 8 times. The PyTorch path gathers the K/V into a dense copy and `repeat_interleave`s it 8x before SDPA, so it writes and re-reads roughly 9x the KV bytes.
 2. **Paged addressing in the kernel.** `slot = block_table[t / 16] * 16 + t % 16`, so there is no gather and no dense copy. A warp reads one 128-byte K row (64 halves, 2 per lane): fully coalesced.
-3. **Split-K over the context (Flash-Decoding).** Each 512-token partition of the context gets its own block, which fixes occupancy at small batch sizes. A second small kernel merges the partitions with the online-softmax rule (the same `(max, sum)` rescaling as `online_merge` in Project 1): `w_p = sum_p · exp(max_p − max)`.
+3. **Split-K over the context (Flash-Decoding).** Each 128-token partition of the context gets its own block, which fixes occupancy at small batch sizes. A second small kernel merges the partitions with the online-softmax rule (the same `(max, sum)` rescaling as `online_merge` in Project 1): `w_p = sum_p · exp(max_p − max)`.
 
 **Inside a block (4 warps):**
 
@@ -66,7 +66,7 @@ The PyTorch time is flat at about 133 µs from 1 to 32 rows: it is dominated by 
 - **Softmax:** `block_max`, then exp and `block_sum`, per head.
 - **Output:** the same token loop accumulates P·V into registers (8 heads × 2 elements per lane). The warps' partial outputs are summed through shared memory.
 
-Compiled for sm_75: 46-64 registers, **0 spills**, 24 KB of shared memory for G = 8 with 512-token partitions.
+Compiled for sm_75: 46-64 registers, **0 spills**, 12 KB of shared memory for G = 8 with 128-token partitions.
 
 | Batch × context | PyTorch (gather+SDPA) | Kernel | Speedup | Kernel GB/s (KV bytes) |
 |---|---:|---:|---:|---:|
@@ -93,7 +93,7 @@ At batch 1 the grid is only (1 sequence × 4 KV heads × partitions) blocks, so 
 - each 4-warp block streams its partition one 128-byte row per warp at a time, with little memory-level parallelism per SM;
 - the softmax runs 8 block-wide reductions, one per query head.
 
-The engine currently calls the kernel with 512-token partitions; switching to 128 is the measured next step.
+The engine now defaults to 128-token partitions (`--attention-partition-size` switches back to 512); end-to-end measurement of the switch on the Colab T4 is still pending.
 
 ## End to end
 

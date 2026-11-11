@@ -40,9 +40,11 @@ class LLMEngine:
         if model is None:
             model = LlamaModel.from_pretrained(cfg.model, self.device, cfg.torch_dtype,
                                                fuse_weights=cfg.fuse_weights,
-                                               use_custom_kernels=cfg.use_custom_kernels)
+                                               use_custom_kernels=cfg.use_custom_kernels,
+                                               attention_partition_size=cfg.attention_partition_size)
         self.model = model
         self.model.use_custom_kernels = cfg.use_custom_kernels
+        self.model.attention_partition_size = cfg.attention_partition_size
         self.mcfg: ModelConfig = model.cfg
         if tokenizer is None and cfg.model:
             from transformers import AutoTokenizer
