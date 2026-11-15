@@ -2,6 +2,8 @@
 
 Measured on a Tesla T4 with vLLM 0.31.0 (`--dtype half`, prefix caching off). Both systems ran the same harness, workload and concurrency levels. Raw data: `results/serving.jsonl` and `results/step_profile_*.json`.
 
+> **Update, Nov 14, 2026 (G1):** the engine now defaults to 128-token paged-attention partitions (commit `45cd362`, `--attention-partition-size` switches back to 512). The ratio table below was measured with the old 512 default; the G1 section further down gives the measured engine-level effect of the switch.
+
 ## The ratio
 
 | Users | tiny-infer, PyTorch ops | tiny-infer + kernels | vLLM | **kernels / vLLM** | TPOT p50: kernels vs vLLM | TTFT p50: kernels vs vLLM |
@@ -17,6 +19,26 @@ Throughput is in output tok/s.
 - **Before the kernels: 26–38% of vLLM. After: 58–71%.**
 - tiny-infer's TTFT is lower than vLLM's at every load, at both p50 and p99 (p99 at 64 users: 2.63 s vs 2.95 s). A likely cause, not yet isolated: decode-first scheduling with a 2,048-token budget admits new prompts quickly.
 - **The whole remaining gap is decode (TPOT).** tiny-infer's TPOT is 1.76x vLLM's at 1 user and about 1.42x from 16 users up.
+
+## G1 update: 128-token partitions, measured end to end (Nov 14, 2026)
+
+The kernel bench had already shown 128-token partitions 1.48–3.38x faster than 512 at the op level (`results/kernel_bench.json`, `split_k_p128_vs_p512`). The open question was whether that survived the full serving path. It did, at a smaller multiple, as expected: attention is one part of a decode step.
+
+Same Colab T4, same serving sweep run twice, once per partition size (`notebooks/g1_partition_check.ipynb`; labels `engine-128` / `engine-512`):
+
+| Users | Output tok/s, 128 | Output tok/s, 512 | **128 / 512** |
+|---:|---:|---:|---:|
+| 1 | 67.9 | 58.5 | **1.16x** |
+| 4 | 204.4 | 181.1 | **1.13x** |
+| 16 | 587.8 | 534.3 | **1.10x** |
+| 32 | 858.1 | 744.2 | **1.15x** |
+
+- Latency was lower for 128 nearly everywhere: ITL p99 and TPOT p50 lower at every concurrency tested, except ITL p99 at 4 users (38.9 vs 38.7 ms), which is a wash. No errors in either sweep.
+- Concurrency 64 was not rerun in this check, so the 64-user row of the table above still reflects the 512 default.
+- **Provenance caveat:** the raw `results/` zip from the Colab run was not retained (the download did not come through), so these numbers are transcribed from the notebook output, not from a results file in this repo. The notebook with full outputs remains open in his Colab tab. Treat the 128/512 ratios as measured, but re-export the raw file if the numbers ever need re-deriving.
+- **Cross-run read (approximate, not same-sweep):** against the original vLLM column above, the 128 numbers would put tiny-infer at roughly 68% of vLLM at 1 user, 74% at 4, 77% at 16, and 84% at 32, up from 58–71%. That comparison mixes two sweeps on different days, so it is an indication, not a measurement. A same-sweep vLLM rerun would be needed to state it as measured.
+
+What this changes in the gap attribution below: item 2's "headroom already measured" is now a closed, engine-level result (1.10–1.16x), and the 128-token row of "What would close it" is done. The kernel itself still runs at 15% of bandwidth at batch 64 with the old profile; no new step profile was taken after G1, so that number is unchanged here.
 
 ## Step 1: the gap that the kernels closed
 
@@ -48,7 +70,7 @@ Each item cites the measured number it rests on. Where the *cause* is inferred r
 2. **The attention kernel at 15% of bandwidth** *(measured)*.
    - At batch 64, attention is **25.7 of 39.4 GPU-ms** (`results/step_profile_b64_kernels.json`).
    - At 64 × 1,024 the kernel moves **48.9 GB/s, 15.3%** of the T4's 320 GB/s (`results/kernel_bench.json`).
-   - Headroom already measured: 128-token partitions beat the engine's current 512 by **1.48–3.38x** across shapes. Beyond that, the kernel needs more bytes in flight per SM.
+   - Headroom already measured, and now closed at the engine level: 128-token partitions beat the engine's former 512 by **1.48–3.38x** at the op level across shapes, and by **1.10–1.16x end to end** in the Nov 14 serving sweep (see the G1 update above). The 128 default shipped in commit `45cd362`. Beyond that, the kernel needs more bytes in flight per SM.
 3. **Serving-stack overhead** *(gap measured, split between causes not measured)*.
    - **Measured:** at 64 users the offline decode step is **44.9 ms** (`kernel_bench.json`), while the served TPOT is **61.8 ms** (`serving.jsonl`).
    - **Likely contributors:**
@@ -68,11 +90,11 @@ Each item cites the measured number it rests on. Where the *cause* is inferred r
 
 | Change | Targets | Evidence it matters | Effort |
 |---|---|---|---|
-| 128-token attention partitions (one-line default change) | item 2 | op-level 1.4–3.4x faster than 512 in every shape | trivial; needs an end-to-end rerun |
+| 128-token attention partitions (one-line default change) | item 2 | **Done (G1, Nov 14):** op-level 1.48–3.38x, engine-level 1.10–1.16x measured | done; needs no further work |
 | CUDA-graph the decode step per batch bucket | item 1 | batch-1 step 16.6 ms vs 6.9 ms floor | medium: static input buffers, padded batch sizes |
 | Engine in its own process; detokenise off the event loop | item 3 | 44.9 ms offline vs 61.8 ms served at batch 64 | medium |
 | Fused RoPE + cache write, fused SiLU·mul | item 4 (+ fewer launches for item 1) | 0.8 ms/step measured, plus fewer launches | small |
 
 ## The one-sentence version (for interviews)
 
-"Out of the box my engine reached 26–38% of vLLM on a T4. The profiler showed half of every decode step was copying K/V out of the paged cache and repeating it for GQA. My paged-attention kernel removed that, which took the engine to 58–71% of vLLM and cut a batch-32 decode step from 80 to 29 ms. What's left is decode-only. My attention kernel still runs at 15% of bandwidth. Serving through one Python process adds 17 ms per step at 64 users. And at batch 1 I'm 2.4x above the weight-read floor, which I attribute to eager launch overhead, since vLLM uses CUDA graphs; a batch-1 profile would confirm it."
+"Out of the box my engine reached 26–38% of vLLM on a T4. The profiler showed half of every decode step was copying K/V out of the paged cache and repeating it for GQA. My paged-attention kernel removed that, which took the engine to 58–71% of vLLM and cut a batch-32 decode step from 80 to 29 ms. Switching the attention partitions from 512 to 128 tokens then gained another 10–16% end to end, measured on the same T4 in November. What's left is decode-only. My attention kernel still runs at 15% of bandwidth. Serving through one Python process adds 17 ms per step at 64 users. And at batch 1 I'm 2.4x above the weight-read floor, which I attribute to eager launch overhead, since vLLM uses CUDA graphs; a batch-1 profile would confirm it."
