@@ -40,6 +40,7 @@ class EngineBackend:
                            kv_cache_gb=args.kv_cache_gb, gpu_memory_utilization=args.gpu_memory_utilization,
                            enable_chunked_prefill=not args.no_chunked_prefill,
                            enable_prefix_caching=args.prefix_caching, use_custom_kernels=args.custom_kernels,
+                           use_cuda_graphs=args.cuda_graphs,
                            attention_partition_size=args.attention_partition_size)
         self.engine = LLMEngine(cfg)
         self.tokenizer = self.engine.tokenizer
@@ -237,6 +238,8 @@ def parse_args(argv=None):
     p.add_argument("--no-chunked-prefill", action="store_true")
     p.add_argument("--prefix-caching", action="store_true")
     p.add_argument("--custom-kernels", action="store_true", help="use the Project 1 CUDA kernels")
+    p.add_argument("--cuda-graphs", action="store_true",
+                   help="capture the decode-only forward per batch bucket (G2; needs --custom-kernels)")
     p.add_argument("--attention-partition-size", type=int, default=128,
                    help="paged-attention split-K partition in tokens (128 default; 512 is the old value)")
     return p.parse_args(argv)

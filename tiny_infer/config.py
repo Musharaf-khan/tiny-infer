@@ -82,6 +82,11 @@ class EngineConfig:
     enable_chunked_prefill: bool = True
     enable_prefix_caching: bool = False
     use_custom_kernels: bool = False      # Project 1 CUDA kernels in the decode path
+    use_cuda_graphs: bool = False         # G2: capture the decode-only forward per batch-size
+                                          # bucket; decode-only steps replay one graph instead of
+                                          # launching every kernel. Requires use_custom_kernels
+                                          # and a CUDA device; otherwise the engine stays eager.
+                                          # GPU verification pending (Colab T4).
     attention_partition_size: int = 128   # paged-attention split-K partition, in tokens; the kernel
                                           # bench measured 128 as 1.48-3.38x faster than 512 in every
                                           # shape (docs/kernels.md). Use 512 to switch back.

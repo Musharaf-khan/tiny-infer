@@ -60,6 +60,17 @@ class LLMEngine:
         self.bm = BlockManager(num_blocks, cfg.block_size, mode=cfg.kv_mode, max_model_len=cfg.max_model_len,
                                enable_prefix_caching=cfg.enable_prefix_caching)
         self.scheduler = Scheduler(cfg, self.bm)
+        # CUDA graphs (G2): decode-only steps replay one captured graph per batch bucket.
+        # Default off; on CPU or without the custom kernels the engine stays eager.
+        self.graph_runner = None
+        if cfg.use_cuda_graphs:
+            if self.device.type != "cuda":
+                log.warning("use_cuda_graphs=True but device is %s; staying eager", self.device.type)
+            elif not cfg.use_custom_kernels:
+                log.warning("use_cuda_graphs=True needs use_custom_kernels=True; staying eager")
+            else:
+                from .cuda_graphs import CUDAGraphRunner
+                self.graph_runner = CUDAGraphRunner(self.model, cfg)
         self.generator = torch.Generator(device=self.device).manual_seed(cfg.seed)
         # stats
         self.num_steps = 0
@@ -186,7 +197,12 @@ class LLMEngine:
             if s.first_scheduled_time is None:
                 s.first_scheduled_time = t0
         input_ids, md, order, sample_seqs, nd, npf = self._prepare(sched)
-        logits = self.model.forward(input_ids, md, self.kv)
+        if self.graph_runner is not None and npf == 0 and nd > 0:
+            logits = self.graph_runner.run(input_ids, md, self.kv)
+            if logits is None:            # batch larger than the biggest bucket: eager fallback
+                logits = self.model.forward(input_ids, md, self.kv)
+        else:
+            logits = self.model.forward(input_ids, md, self.kv)
         tokens = self._sample(logits, sample_seqs) if sample_seqs else []   # .tolist() syncs the GPU
         now = time.perf_counter()
         self.step_times.append((nd, npf, now - t0))
