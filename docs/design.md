@@ -108,16 +108,29 @@ New K/V are written into the pool with one `index_copy_` per layer, using a `slo
 
 See [kernels.md](kernels.md) for the full write-up. They are registered with `TORCH_LIBRARY(tiny_infer, …)` as custom ops whose schemas mark mutated arguments (`Tensor(a!)`). They are JIT-built with `torch.utils.cpp_extension.load`. At startup they are self-tested against the PyTorch references, and the engine refuses to serve if a kernel disagrees.
 
-## 9. Correctness strategy
+## 9. CUDA graphs for decode steps (`cuda_graphs.py`)
+
+**Why.** The batch-1 decode step takes 16.6 ms against a 6.9 ms weight-read floor (see [vllm_gap.md](vllm_gap.md)). vLLM captured CUDA graphs and used `torch.compile`; tiny-infer launches every op eagerly. The launch overhead is the suspected cause, inferred not isolated: a batch-1 profile would confirm it. CUDA graphs remove the per-op CPU launch cost by replaying one captured launch sequence per step.
+
+**What landed (G2 slice 1).** `CUDAGraphRunner` captures one graph per batch-size bucket (powers of two up to `max_num_seqs`). Each bucket keeps static input buffers; per step the real `input_ids` and attention metadata are copied in, the graph is replayed, and logits are read from the bucket's static output buffer (only the first `nd` rows are valid, and the caller must sample before the next replay overwrites them). All graphs share one CUDA graph memory pool.
+
+- **Decode-only.** The engine replays only when the step has no prefill tokens (`npf == 0`); prefill and chunked-prefill steps stay eager. A batch larger than the biggest bucket falls back to the eager forward.
+- **Padding is idempotent.** Rows beyond the real batch duplicate row 0, so their K/V write writes the same token to the same slot twice: harmless, and it keeps the captured shapes fixed.
+- **Captured context is worst-case.** The captured `max_decode_context` is `max_model_len`, which is correct for every step because empty partitions are ignored by the kernel merge, but short contexts pay the worst-case partition count. Context-length bucketing is the follow-up (see §11).
+- **Opt-in, default off.** `--cuda-graphs` / `use_cuda_graphs`; it requires the custom-kernel path and CUDA, and falls back to eager on CPU with a warning.
+- **CPU verification.** `tests/test_cuda_graphs.py` covers bucketing, padding, refusal on non-CUDA devices, and the engine flag falling back on CPU while staying token-identical to HF. Full suite: 46 passed, 1 skipped (2026-11-17).
+- **GPU verification pending (Colab T4).** Capture/replay has not yet run on a GPU, so no speedup number is claimed here. The follow-up is to measure decode step time with `--cuda-graphs` on the T4 at batch 1/4/16/32 versus eager, then add context-length bucketing, and only then consider default-on.
+
+## 10. Correctness strategy
 
 - **The oracle:** greedy output must be identical to HF `generate()`.
 - **fp32 on CPU (tests):** exact match is required for 10 configurations.
 - **fp32 on GPU (real model):** exact match is required, except where HF's own top-2 logits are tied to within 1e-3.
 - **fp16 with kernels:** different reduction orders (cuBLAS picks different GEMM tiles for batch 1 and batch 32; the RMSNorm sum order differs) can flip an argmax only where the top-2 logits are within fp16 noise. Every divergence is reported with its logit gap, and a gap above 0.5 fails the check.
 
-## 10. What I'd do next (ordered by expected gain)
+## 11. What I'd do next (ordered by expected gain)
 
-1. CUDA graphs for decode steps, captured per batch-size bucket. This removes the CPU launch overhead; see [vllm_gap.md](vllm_gap.md) for how big that overhead is.
+1. ~~CUDA graphs for decode steps, captured per batch-size bucket.~~ **Done (slice 1, §9):** capture/replay for decode-only steps, opt-in, GPU verification pending on the T4. Follow-up: measure decode step time with `--cuda-graphs` at batch 1/4/16/32 versus eager, then add context-length bucketing so short contexts do not pay the worst-case partition count; only then consider default-on.
 2. Prepare the next step's inputs on the CPU while the GPU runs this one (async scheduling).
 3. Fused RoPE + KV-cache write kernel, and fused SiLU·mul.
 4. A FlashAttention-style kernel for chunked prefill over paged context, instead of gather + SDPA.

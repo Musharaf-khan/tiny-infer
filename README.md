@@ -254,10 +254,11 @@ This is a single-GPU engine with Python-level scheduling.
 **Not included:**
 - tensor or pipeline parallelism
 - disaggregated prefill/decode
-- CUDA graphs
 - speculative decoding
 - quantisation
 - production hardening such as autoscaling or fault tolerance
+
+**Included, opt-in:** CUDA graphs for decode-only steps (`--cuda-graphs`), one captured graph per batch-size bucket; see [docs/design.md](docs/design.md). GPU verification is pending on the T4, so no speedup is claimed.
 
 **Not supported:**
 - copy-on-write forking, because nothing forks. Only full blocks are shared, so a shared block is never written. CoW would be needed for parallel sampling and beam search; it's explained in [docs/design.md](docs/design.md).
