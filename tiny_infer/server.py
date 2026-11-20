@@ -14,6 +14,9 @@ import argparse
 import asyncio
 import json
 import logging
+import socket
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -28,31 +31,115 @@ from .sequence import SamplingParams
 log = logging.getLogger("tiny_infer.server")
 
 
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def make_engine_config(args):
+    from .config import EngineConfig
+    return EngineConfig(model=args.model, dtype=args.dtype, device=args.device, block_size=args.block_size,
+                        max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
+                        max_num_batched_tokens=args.max_num_batched_tokens, kv_mode=args.kv_mode,
+                        kv_cache_gb=args.kv_cache_gb, gpu_memory_utilization=args.gpu_memory_utilization,
+                        enable_chunked_prefill=not args.no_chunked_prefill,
+                        enable_prefix_caching=args.prefix_caching, use_custom_kernels=args.custom_kernels,
+                        use_cuda_graphs=args.cuda_graphs,
+                        attention_partition_size=args.attention_partition_size)
+
+
+def spawn_engine_worker(args):
+    """Start the engine in its own process (G3) and return (proc, host, port, sock).
+
+    The readiness probe socket IS the IPC connection: the worker serves a single
+    connection and exits when it closes, so the probe must not be thrown away.
+    """
+    port = free_port()
+    cmd = [sys.executable, "-m", "tiny_infer.engine_worker",
+           "--model", args.model, "--dtype", args.dtype, "--device", args.device,
+           "--block-size", str(args.block_size), "--max-model-len", str(args.max_model_len),
+           "--max-num-seqs", str(args.max_num_seqs),
+           "--max-num-batched-tokens", str(args.max_num_batched_tokens),
+           "--kv-mode", args.kv_mode,
+           "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+           "--attention-partition-size", str(args.attention_partition_size),
+           "--host", "127.0.0.1", "--port", str(port)]
+    if args.kv_cache_gb is not None:
+        cmd += ["--kv-cache-gb", str(args.kv_cache_gb)]
+    if args.no_chunked_prefill:
+        cmd += ["--no-chunked-prefill"]
+    if args.prefix_caching:
+        cmd += ["--prefix-caching"]
+    if args.custom_kernels:
+        cmd += ["--custom-kernels"]
+    if args.cuda_graphs:
+        cmd += ["--cuda-graphs"]
+    proc = subprocess.Popen(cmd)
+    deadline = time.time() + 120
+    last_err: OSError | None = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"engine worker exited during startup (code {proc.returncode})")
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+            return proc, "127.0.0.1", port, sock
+        except OSError as e:
+            last_err = e
+            time.sleep(0.2)
+    proc.terminate()
+    raise RuntimeError(f"engine worker did not start listening in 120s: {last_err}")
+
+
 # ----------------------------------------------------------------------------- backends
 class EngineBackend:
     def __init__(self, args):
+        self.name = "tiny-infer"
+        self._worker_proc = None
+        self._remote = None
+        if getattr(args, "engine_process", False):
+            # G3: the engine lives in its own process; this process only does HTTP.
+            from .ipc import RemoteEngine
+            from transformers import AutoTokenizer
+            self._worker_proc, host, port, sock = spawn_engine_worker(args)
+            self._remote = RemoteEngine(host, port, sock=sock)
+            self.engine = None
+            self.tokenizer = AutoTokenizer.from_pretrained(args.model)
+            self.aengine = self._remote
+            return
         from .async_engine import AsyncEngine
-        from .config import EngineConfig
         from .engine import LLMEngine
-        cfg = EngineConfig(model=args.model, dtype=args.dtype, device=args.device, block_size=args.block_size,
-                           max_model_len=args.max_model_len, max_num_seqs=args.max_num_seqs,
-                           max_num_batched_tokens=args.max_num_batched_tokens, kv_mode=args.kv_mode,
-                           kv_cache_gb=args.kv_cache_gb, gpu_memory_utilization=args.gpu_memory_utilization,
-                           enable_chunked_prefill=not args.no_chunked_prefill,
-                           enable_prefix_caching=args.prefix_caching, use_custom_kernels=args.custom_kernels,
-                           use_cuda_graphs=args.cuda_graphs,
-                           attention_partition_size=args.attention_partition_size)
+        cfg = make_engine_config(args)
         self.engine = LLMEngine(cfg)
         self.tokenizer = self.engine.tokenizer
         self.aengine = AsyncEngine(self.engine)
-        self.name = "tiny-infer"
 
     async def stream(self, prompt, params: SamplingParams, rid: str):
         async for ev in self.aengine.generate(prompt, params, rid):
             yield ev
 
     def stats(self):
+        if self._remote is not None:
+            return self._remote.stats()
         return self.engine.stats()
+
+    def shutdown(self):
+        if self._remote is not None:
+            try:
+                self._remote.close()
+            except Exception:
+                pass
+            self._remote = None
+        if self._worker_proc is not None:
+            proc, self._worker_proc = self._worker_proc, None
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
 
 class _IdStreamer:
@@ -242,6 +329,8 @@ def parse_args(argv=None):
                    help="capture the decode-only forward per batch bucket (G2; needs --custom-kernels)")
     p.add_argument("--attention-partition-size", type=int, default=128,
                    help="paged-attention split-K partition in tokens (128 default; 512 is the old value)")
+    p.add_argument("--engine-process", action="store_true",
+                   help="run the engine in its own process, connected over localhost IPC (G3)")
     return p.parse_args(argv)
 
 
@@ -249,7 +338,12 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     args = parse_args(argv)
     backend = EngineBackend(args) if args.backend == "engine" else NaiveBackend(args)
-    uvicorn.run(build_app(backend), host=args.host, port=args.port, log_level="warning")
+    try:
+        uvicorn.run(build_app(backend), host=args.host, port=args.port, log_level="warning")
+    finally:
+        shutdown = getattr(backend, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
 
 
 if __name__ == "__main__":

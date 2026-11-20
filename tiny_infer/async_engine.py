@@ -94,3 +94,7 @@ class AsyncEngine:
     def shutdown(self) -> None:
         self._stop = True
         self._wake.set()
+        # Join the loop thread: a daemon thread still inside a torch op when the
+        # interpreter finalises can abort the process (libstdc++ std::terminate),
+        # which is what killed the G3 worker subprocess on exit until this join.
+        self._thread.join(timeout=5)
