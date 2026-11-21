@@ -1,6 +1,8 @@
 # tiny-infer: complete project brief
 
-**Author:** Musharaf Khan Pathan · **Repo:** https://github.com/Musharaf-khan/tiny-infer · **Status as of 2026-10-15:** working prototype, all benchmarks measured on an NVIDIA Tesla T4.
+**Author:** Musharaf Khan Pathan · **Repo:** https://github.com/Musharaf-khan/tiny-infer · **Status as of 2026-11-21:** working prototype, all benchmarks measured on an NVIDIA Tesla T4.
+
+**Status update (2026-11-21).** Since the Oct 15 baseline, three of the four gap items in section 12 have landed as first slices: G1 (128-token attention partitions, now the default, engine-level measured on the T4 Nov 14), G2 slice 1 (opt-in CUDA-graph capture for decode steps, CPU-verified, GPU verification pending), and G3 slice 1 (engine in its own process over localhost IPC, CPU-verified, GPU verification pending). The serving numbers in section 9.1 were measured with the old 512-token default; section 9.7 gives the measured engine-level effect of the switch. Nothing in this update changes the headline 58–71% of vLLM figure, which is still the only same-sweep vLLM comparison. The test suite has grown from 29 to 61 tests (section 10).
 
 ---
 
@@ -30,6 +32,7 @@ tiny-infer is an LLM inference server built from scratch in Python and CUDA. It 
 - **chunked prefill**;
 - an **OpenAI-compatible HTTP API** with token streaming over server-sent events;
 - two **custom CUDA kernels** written by the author: a GQA-aware paged decode-attention kernel and a fused residual-add + RMSNorm kernel. They are registered as PyTorch custom ops and plugged into the decode path.
+- an **opt-in CUDA-graph capture** for decode-only steps (`--cuda-graphs`), and an **optional separate engine process** over localhost IPC (`--engine-process`). Both landed after the Oct 15 baseline; both are CPU-verified, and GPU verification is still pending on the T4 (sections 9.7, 12).
 
 The author benchmarked it on a single NVIDIA T4 serving TinyLlama-1.1B (FP16) against three baselines, all through one harness:
 - HuggingFace `generate()`;
@@ -138,20 +141,23 @@ The per-step token budget (`max_num_batched_tokens`, default 2,048) bounds step 
 
 | File | Lines | What it does |
 |---|---:|---|
-| `tiny_infer/config.py` | 100 | `ModelConfig` (read from a HuggingFace config) with KV-cache math (`kv_bytes_per_token`, `kv_math`); `EngineConfig` (all engine knobs). |
+| `tiny_infer/config.py` | 108 | `ModelConfig` (read from a HuggingFace config) with KV-cache math (`kv_bytes_per_token`, `kv_math`); `EngineConfig` (all engine knobs, including `attention_partition_size`, default 128). |
 | `tiny_infer/sequence.py` | 87 | `Sequence` (token_ids, num_computed_tokens, block table, timing) and `SamplingParams` (max_tokens, temperature, top_p, stop tokens, ignore_eos). |
 | `tiny_infer/block_manager.py` | 192 | Paged KV block manager:<br>• free list and reference counts<br>• per-sequence block tables<br>• **paged** (on-demand) and **contiguous** (reserve max length) modes<br>• **prefix caching**: full blocks hashed as `hash(parent_hash, 16 token ids)`, shared via ref counts, kept in an LRU list after release and evicted only when the free list is empty<br>• rollback on allocation failure |
 | `tiny_infer/scheduler.py` | 135 | Iteration-level scheduler: decode-first, chunked prefill, FCFS admission, newest-first recompute preemption, abort. |
-| `tiny_infer/model.py` | 187 | Llama forward pass over a **packed batch** with fused QKV and fused gate/up weights:<br>• K/V written into the block pool via a slot mapping<br>• decode rows → paged decode attention<br>• fresh prefill → causal SDPA<br>• chunked/prefix-hit prefill → gather from cache with an offset causal mask<br>• `lm_head` run only on rows being sampled<br>• RoPE tables built exactly like HuggingFace's. |
+| `tiny_infer/model.py` | 189 | Llama forward pass over a **packed batch** with fused QKV and fused gate/up weights:<br>• K/V written into the block pool via a slot mapping<br>• decode rows → paged decode attention<br>• fresh prefill → causal SDPA<br>• chunked/prefix-hit prefill → gather from cache with an offset causal mask<br>• `lm_head` run only on rows being sampled<br>• RoPE tables built exactly like HuggingFace's. |
 | `tiny_infer/ops.py` | 110 | PyTorch reference implementations that match HuggingFace's Llama numerics (RMSNorm, fused add+RMSNorm, paged decode attention), plus dispatchers that route to the CUDA kernels when enabled. |
 | `tiny_infer/kernels.py` | 70 | JIT-builds the CUDA extension (`torch.utils.cpp_extension`) and **self-tests** every kernel against its reference. The engine refuses to start if any kernel disagrees. |
+| `tiny_infer/cuda_graphs.py` | 174 | `CUDAGraphRunner`: one captured CUDA graph per batch-size bucket (powers of two up to `max_num_seqs`), static input/output buffers, shared graph memory pool; decode-only replay, eager fallback on CPU or when no bucket fits (G2 slice 1, Nov 17). |
+| `tiny_infer/ipc.py` | 300 | Newline-delimited JSON protocol (add/abort/stats/shutdown; prompt/token/done/error/stats replies) and a `RemoteEngine` client that is a drop-in for `AsyncEngine.generate()` (G3 slice 1, Nov 20). |
+| `tiny_infer/engine_worker.py` | 28 | Entry point for the engine worker process: serves one engine over IPC and exits when the server disconnects (G3 slice 1, Nov 20). |
 | `tiny_infer/csrc/rms_norm.cu` | 124 | Fused residual-add + RMSNorm CUDA kernel (FP16). |
 | `tiny_infer/csrc/paged_attention.cu` | 266 | GQA-aware paged decode-attention CUDA kernel with split-K, plus a partition-combine kernel. |
 | `tiny_infer/csrc/reduce.cuh` | 60 | Warp-shuffle and block reductions (carried over from Project 1). |
 | `tiny_infer/csrc/ops.cpp` | 27 | Registers the kernels as PyTorch custom ops via `TORCH_LIBRARY(tiny_infer, …)`, with mutation-annotated schemas (`Tensor(a!)`). |
-| `tiny_infer/engine.py` | 237 | `LLMEngine`. Its `step()` runs schedule → prepare inputs → forward → sample → retire. It also sizes the KV pool by profiling peak activation memory and collects stats (peak concurrency, KV waste, preemptions, per-step timing). |
-| `tiny_infer/async_engine.py` | 96 | Runs the engine loop in a background thread and streams tokens to asyncio consumers. Handles client disconnects (aborts) and reports errors per request. |
-| `tiny_infer/server.py` | 250 | FastAPI server: OpenAI-compatible `/v1/completions` (streaming and non-streaming), `/health`, `/stats`, `/v1/models`. Two backends: `engine` (tiny-infer) and `naive` (one HF `generate()` at a time, for comparison). |
+| `tiny_infer/engine.py` | 255 | `LLMEngine`. Its `step()` runs schedule → prepare inputs → forward → sample → retire. It also sizes the KV pool by profiling peak activation memory and collects stats (peak concurrency, KV waste, preemptions, per-step timing). |
+| `tiny_infer/async_engine.py` | 100 | Runs the engine loop in a background thread and streams tokens to asyncio consumers. Handles client disconnects (aborts) and reports errors per request. Its `shutdown()` joins the engine-loop thread, so a worker process exits cleanly instead of aborting at interpreter shutdown (G3 slice 1, Nov 20). |
+| `tiny_infer/server.py` | 350 | FastAPI server: OpenAI-compatible `/v1/completions` (streaming and non-streaming), `/health`, `/stats`, `/v1/models`. Two backends: `engine` (tiny-infer) and `naive` (one HF `generate()` at a time, for comparison). With `--engine-process` it spawns the engine worker, loads its own tokenizer for detokenisation, and takes stats over IPC. |
 | `tiny_infer/hf_utils.py` | 23 | Version-safe HuggingFace model loading, verified to load the requested dtype. |
 | `bench/harness.py` | — | Benchmark client for **any** OpenAI-compatible endpoint (used for tiny-infer, the naive server and vLLM alike). |
 | `bench/hf_baseline.py` | — | HuggingFace `generate()` baseline (concurrency 1, plus padded static batching). |
@@ -161,9 +167,9 @@ The per-step token budget (`max_num_batched_tokens`, default 2,048) bounds step 
 | `bench/make_report.py` | — | Generates `results/REPORT.md` and charts from raw results. |
 | `scripts/` | — | Real-model correctness check (`check_correctness.py`), server benchmark orchestration, live 8-user streaming demo (`demo.py`), KV-math calculator (`kv_math.py`). |
 | `notebooks/` | — | Colab T4 runbooks that produce every number in `results/`. |
-| `tests/` | — | 29 automated tests (section 10). |
+| `tests/` | — | 61 automated tests (section 10). |
 
-Totals: about 1,500 lines of engine Python, about 480 lines of CUDA/C++, and about 1,700 lines of benchmarks, scripts and tests. CI runs the tests on every push with GitHub Actions. A Dockerfile is included.
+Totals: about 2,100 lines of engine Python, about 480 lines of CUDA/C++, and about 2,300 lines of benchmarks, scripts and tests. CI runs the tests on every push with GitHub Actions. A Dockerfile is included.
 
 **Server flags:**
 - `--custom-kernels`
@@ -175,6 +181,9 @@ Totals: about 1,500 lines of engine Python, about 480 lines of CUDA/C++, and abo
 - `--max-num-seqs`
 - `--block-size`
 - `--backend engine|naive`
+- `--attention-partition-size` (default 128; 512 is the old value)
+- `--cuda-graphs` (opt-in; decode-only capture, falls back to eager on CPU)
+- `--engine-process` (opt-in; run the engine in its own process over IPC)
 
 ---
 
@@ -226,9 +235,9 @@ Totals: about 1,500 lines of engine Python, about 480 lines of CUDA/C++, and abo
 
 **Compile:** 45–64 registers, **0 spills**, 24 KB shared memory (G = 8, 512-token partitions).
 
-**Measured (T4):** **3.3–6.7x faster** than gather + repeat + SDPA. At 32 sequences × 1,024 context: 4.59 ms → 0.69 ms. It peaks at **48.9 GB/s, about 15% of the T4's 320 GB/s**: correct and fast, but not yet bandwidth-bound.
+**Measured (T4):** **3.3–6.7x faster** than gather + repeat + SDPA. At 32 sequences × 1,024 context: 4.59 ms → 0.69 ms. It peaks at **48.9 GB/s, about 15% of the T4's 320 GB/s**: correct and fast, but not yet bandwidth-bound. No new step profile was taken after G1, so this number is unchanged.
 
-**Split-K, measured:** 128-token partitions were **1.48–3.38x faster** than 512-token ones in every shape tested. The gain is biggest at batch 1, where parallelism is scarce. The engine still uses 512 by default; switching is a measured next step.
+**Split-K, measured:** 128-token partitions were **1.48–3.38x faster** than 512-token ones in every shape tested. The gain is biggest at batch 1, where parallelism is scarce. **The engine now uses 128 by default** (G1, Nov 14, 2026); `--attention-partition-size 512` switches back. The engine-level effect is measured in section 9.7: **1.10–1.16x** end-to-end throughput on the same T4.
 
 **Correctness of both kernels:** the startup self-test passes, with a worst max abs error of **2.0e-3** in FP16. It covers ragged lengths, shuffled physical blocks, GQA groups of 8 and 1, head dims 64 and 128, and both partition sizes.
 
@@ -257,6 +266,8 @@ The kernel on/off end-to-end comparison in `kernel_bench.json` was run interleav
 ## 9. Measured results (all on a T4)
 
 ### 9.1 Serving throughput and latency
+
+*Note (Nov 2026): this table was measured with the old 512-token attention-partition default. The engine now defaults to 128 tokens; section 9.7 measures the difference. The 64-user row was not rerun in that check, so it still reflects 512.*
 
 | System | Users | Output tok/s | p50 TTFT | p99 TTFT | p50 TPOT |
 |---|---:|---:|---:|---:|---:|
@@ -350,13 +361,36 @@ Result: **3.8x** lower p99 TTFT, **1.8x** lower p50 TTFT, **1.42x** throughput.
 
 The gain grows with batch because attention's share of the step grows with batch × context, while the weight-reading GEMMs, which the kernels don't touch, stay roughly constant. That is Amdahl's law.
 
+### 9.7 G1: 128-token partitions, engine level (T4, Nov 14, 2026)
+
+The kernel bench had already shown 128-token partitions 1.48–3.38x faster than 512 at the op level. The open question was whether that survived the full serving path. It did, at a smaller multiple, as expected: attention is one part of a decode step.
+
+Same Colab T4, same serving sweep run twice, once per partition size (`notebooks/g1_partition_check.ipynb`; labels `engine-128` / `engine-512`), custom kernels on, concurrency 1/4/16/32:
+
+| Users | Output tok/s, 128 | Output tok/s, 512 | 128 / 512 | ITL p99, 128 | ITL p99, 512 | TPOT p50, 128 | TPOT p50, 512 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 67.9 | 58.5 | **1.16x** | – | – | – | – |
+| 4 | 204.4 | 181.1 | **1.13x** | 38.9 ms | 38.7 ms | – | – |
+| 16 | 587.8 | 534.3 | **1.10x** | – | – | – | – |
+| 32 | 858.1 | 744.2 | **1.15x** | – | – | – | – |
+
+- Latency was lower for 128 nearly everywhere: ITL p99 and TPOT p50 lower at every concurrency tested, except ITL p99 at 4 users (38.9 vs 38.7 ms), which is a wash. No errors in either sweep.
+- Concurrency 64 was not rerun in this check, so the 64-user row of section 9.1 still reflects the 512 default.
+- **Provenance caveat:** the raw `results/` zip from the Colab run was not retained (the download did not come through), so these numbers are transcribed from the notebook output, not from a results file in this repo. Treat the 128/512 ratios as measured, but re-export the raw file if the numbers ever need re-deriving.
+- **Cross-run read (approximate, not same-sweep):** against the original vLLM column in section 9.1, the 128 numbers would put tiny-infer at roughly 68% of vLLM at 1 user, 74% at 4, 77% at 16, and 84% at 32, up from 58–71%. That comparison mixes two sweeps on different days, so it is an indication, not a measurement. A same-sweep vLLM rerun would be needed to state it as measured.
+
+### 9.8 What is still unmeasured on the GPU (Nov 21, 2026)
+
+- **CUDA graphs (G2 slice 1):** capture/replay has not yet run on a GPU. No speedup number is claimed. The follow-up is to measure decode step time with `--cuda-graphs` on the T4 at batch 1/4/16/32 versus eager.
+- **Separate engine process (G3 slice 1):** the split has not yet run on a GPU. The follow-up is to measure TPOT/throughput through HTTP with `--engine-process` on the T4 versus in-process, to see whether it closes any of the 44.9 ms offline vs 61.8 ms served gap at 64 users (section 12, item 2).
+
 ---
 
 ## 10. Correctness: what is proven, and by which check
 
 | # | Check | What it compares | Status |
 |---|---|---|---|
-| 1 | Test-suite oracle | tiny-infer vs HF `generate()`, token for token, on a small random Llama (GQA, RoPE, RMSNorm, SwiGLU), FP32, CPU | **Passed, 29/29 tests, green in CI** |
+| 1 | Test-suite oracle | tiny-infer vs HF `generate()`, token for token, on a small random Llama (GQA, RoPE, RMSNorm, SwiGLU), FP32, CPU | **Passed, 61 tests (60 passed, 1 skipped on CPU), green in CI** |
 | 2 | Kernels vs PyTorch ops | tiny-infer with vs without the CUDA kernels on real TinyLlama, 256 greedy tokens at batch 1/16/32/64 | **Passed: 100% identical** |
 | 3 | Kernel self-test | each kernel vs its PyTorch reference on random data | **Passed: worst error 2.0e-3** |
 | 4 | Real-model oracle | tiny-infer vs HF `generate()` on real TinyLlama, 12 prompts | **Pending re-run** (see below) |
@@ -380,12 +414,17 @@ Plus scheduler policy, block-manager invariants, HTTP/SSE streaming with concurr
 - **Fix:** both sides now stop at EOS naturally, and a regression test reproduces the original failure.
 - **Pending:** the fixed check has not been re-run on the GPU yet.
 
-**The 29 tests:**
+**The 61 tests:**
 - 8 block manager;
 - 11 HF-equivalence and correctness;
 - 4 scheduler;
 - 4 HTTP server and harness;
-- 2 regression.
+- 2 regression;
+- 11 paged-attention partitions (split-K reference vs unpartitioned SDPA at 128 and 512 tokens, ragged lengths, shuffled blocks, GQA 8 and 1, partition-boundary lengths; 128 pinned as default everywhere);
+- 13 CUDA-graph capture path (bucketing, static-buffer padding, eager fallback, refusal on non-CUDA);
+- 8 split engine/server processes (IPC protocol ordering/multiplexing/abort/validation, real worker subprocess token-identical to HF, real HTTP server over the remote engine).
+
+The one skip is the kernel self-test, which runs only when CUDA is present.
 
 ---
 
@@ -403,16 +442,16 @@ Plus scheduler policy, block-manager invariants, HTTP/SSE streaming with concurr
 
 After the kernels, the remaining gap is entirely in decode (TPOT). Each cause, with its evidence:
 
-1. **Attention kernel at 15% of bandwidth** *(measured)*. At batch 64, attention is 25.7 of 39.4 GPU-ms, at 48.9 GB/s of 320. Smaller split-K partitions are already measured to be 1.48–3.38x faster.
-2. **Serving-stack overhead** *(gap measured, causes not split)*. The decode step takes 44.9 ms offline but TPOT is 61.8 ms through the HTTP server at 64 users. In tiny-infer, detokenisation and HTTP share one Python process with the engine. vLLM's log shows separate API-server and engine processes.
-3. **Small-batch launch overhead** *(cause inferred, not isolated)*. The batch-1 decode step takes 16.6 ms against a 6.9 ms weight-read floor; vLLM's TPOT is 9.6 ms. vLLM captured CUDA graphs and used `torch.compile`, while tiny-infer launches every op eagerly. A batch-1 profile would confirm this.
+1. **Attention kernel at 15% of bandwidth** *(measured)*. At batch 64, attention is 25.7 of 39.4 GPU-ms, at 48.9 GB/s of 320. **G1 closed the measured headroom:** 128-token partitions beat 512 by 1.48–3.38x at the op level and 1.10–1.16x end to end (section 9.7). Beyond that, the kernel needs more bytes in flight per SM; no new step profile was taken after G1, so the 15% figure is unchanged.
+2. **Serving-stack overhead** *(gap measured, causes not split)*. The decode step takes 44.9 ms offline but TPOT is 61.8 ms through the HTTP server at 64 users. **G3 slice 1 landed Nov 20:** the engine can now run in its own process over localhost IPC (`--engine-process`), with detokenisation in the server process. Whether the split closes any of the 44.9 → 61.8 ms gap is **not yet measured** on the GPU (section 9.8). vLLM's log shows separate API-server and engine processes.
+3. **Small-batch launch overhead** *(cause inferred, not isolated)*. The batch-1 decode step takes 16.6 ms against a 6.9 ms weight-read floor; vLLM's TPOT is 9.6 ms. **G2 slice 1 landed Nov 17:** CUDA graphs are captured per batch-size bucket for decode-only steps (`--cuda-graphs`, opt-in, eager fallback). Whether graphs close the batch-1 gap is **not yet measured** on the GPU (section 9.8); a batch-1 profile would confirm the cause. vLLM captured CUDA graphs and used `torch.compile`, while tiny-infer launches every op eagerly unless `--cuda-graphs` is passed.
 4. **Unfused glue** *(measured, small)*. RoPE, SiLU·mul and the KV-cache writes are separate ops: 0.8 ms per batch-32 step.
 
 **Next steps, in order:**
-1. 128-token attention partitions;
-2. CUDA graphs for decode;
-3. separate the engine process from the server;
-4. fused RoPE + cache write.
+1. ~~128-token attention partitions~~ — **done (G1, Nov 14):** op-level 1.48–3.38x, engine-level 1.10–1.16x measured on the T4.
+2. ~~CUDA graphs for decode~~ — **slice 1 done (G2, Nov 17), GPU measurement pending:** measure decode step time with `--cuda-graphs` at batch 1/4/16/32 vs eager; then context-length bucketing so short contexts do not pay the worst-case partition count; only then consider default-on.
+3. ~~Separate the engine process from the server~~ — **slice 1 done (G3, Nov 20), GPU measurement pending:** measure TPOT/throughput through HTTP with `--engine-process` vs in-process on the T4; add reconnect handling for a dropped engine connection; only then consider default-on.
+4. Fused RoPE + cache write.
 
 ---
 
@@ -421,12 +460,14 @@ After the kernels, the remaining gap is entirely in decode (TPOT). Each cause, w
 | Don't say | Why | Say instead |
 |---|---|---|
 | "Deployed", "in production", "live website", "product" | It runs only while someone starts a GPU; there is no hosted service | "working prototype", "from-scratch inference server" |
-| "Token-identical to HuggingFace on TinyLlama" | The real-model check (section 10, #4) is pending re-run | "verified token-identical to HuggingFace in a 29-test suite"; "kernels leave greedy output unchanged" |
+| "Token-identical to HuggingFace on TinyLlama" | The real-model check (section 10, #4) is pending re-run | "verified token-identical to HuggingFace in a 61-test suite"; "kernels leave greedy output unchanged" |
 | "Matches / beats vLLM" | It reaches 58–71% of vLLM's throughput | "58–71% of vLLM's throughput, with lower TTFT" |
+| "68–84% of vLLM" | That is a cross-run indication from the G1 check (section 9.7), mixing sweeps on different days, not a same-sweep measurement | "58–71% (same-sweep); the G1 switch suggests 68–84%, pending a same-sweep vLLM rerun" |
 | "~70% of vLLM" or "3x faster" | Inflated rounding | "58–71%", "2.75x" |
 | "Kernels are bandwidth-optimal" | The attention kernel is at ~15% of peak bandwidth | "3.3–6.7x faster than the PyTorch path" |
 | "Chunked prefill reduced latency" | It raised TTFT | "cut p99 inter-token latency 44% at the cost of higher TTFT" |
-| "Multi-GPU", "distributed", "tensor parallel", "speculative decoding", "quantization", "CUDA graphs" | Not implemented | — |
+| "Multi-GPU", "distributed", "tensor parallel", "speculative decoding", "quantization" | Not implemented | — |
+| "CUDA graphs speed up decode" / "the engine runs in its own process" as a measured win | Both landed (opt-in flags `--cuda-graphs` and `--engine-process`) but neither has a GPU measurement yet | "CUDA graphs landed opt-in, GPU verification pending"; "engine-process split landed opt-in, GPU verification pending" |
 | "16x faster than vLLM" or "16x than HuggingFace" | 16x is vs the naive one-at-a-time server | "16x a one-request-at-a-time server" |
 | "6.2x throughput" | 6.2x is concurrent *requests*; throughput was 1.21x | "6.2x more concurrent requests in the same memory" |
 | "Served real users" | It was benchmarked with a load generator | "benchmarked at up to 64 concurrent clients" |
@@ -467,19 +508,19 @@ After the kernels, the remaining gap is entirely in decode (TPOT). Each cause, w
 
 **AI infrastructure / inference engineer:**
 - Implemented iteration-level continuous batching with decode-first scheduling, chunked prefill and recompute preemption. It reached **7.75x** the throughput of a sequential server at 16 users without kernels and **16x** with them, keeping median time-to-first-token under 150 ms.
-- Benchmarked against **vLLM 0.31.0** with a single harness and attributed the remaining gap with profiler data: attention kernel at 15% of bandwidth, single-process serving overhead, and no CUDA graphs.
+- Benchmarked against **vLLM 0.31.0** with a single harness and attributed the remaining gap with profiler data: attention kernel at 15% of bandwidth, single-process serving overhead, and no CUDA graphs. Since then, 128-token attention partitions (measured 1.10–1.16x end to end), opt-in CUDA graphs, and an opt-in separate engine process have landed; GPU measurement of the last two is still pending.
 
 **GPU / CUDA engineer:**
 - Wrote a GQA-aware paged decode-attention CUDA kernel (Flash-Decoding split-K, warp-shuffle reductions, 0 register spills), **3.3–6.7x** faster than PyTorch's gather + SDPA path on a T4.
 - Fused residual-add + RMSNorm into one FP16 kernel matching HuggingFace's rounding order, **10–13x** faster than the 9-op PyTorch sequence at decode sizes.
 
 **General software engineer:**
-- Built a 29-test correctness suite verifying token-identical output against HuggingFace across batching, paging, chunking, prefix caching and preemption, running in CI on every push.
+- Built a 61-test correctness suite verifying token-identical output against HuggingFace across batching, paging, chunking, prefix caching and preemption, running in CI on every push.
 - Root-caused three measurement bugs, including a correctness check that hid EOS and a Unicode SSE parsing bug that broke 3 of 416 benchmark requests, before publishing results.
 
 ### 30-second interview pitch
 
-"I built tiny-infer, a small vLLM from scratch: continuous batching, a paged KV cache, prefix caching and a streaming OpenAI-style API. Then I plugged in CUDA kernels from my previous project. On a T4 with TinyLlama, paging alone fit 6.2 times more users in the same memory. Profiling showed half of every decode step was copying the KV cache, so I wrote a paged-attention kernel that reads the cache in place. That cut a decode step from 80 to 29 milliseconds and took me from about a third of vLLM's throughput to 58–71%. The rest of the gap is decode-side, and I can show you with profiler numbers where it goes."
+"I built tiny-infer, a small vLLM from scratch: continuous batching, a paged KV cache, prefix caching and a streaming OpenAI-style API. Then I plugged in CUDA kernels from my previous project. On a T4 with TinyLlama, paging alone fit 6.2 times more users in the same memory. Profiling showed half of every decode step was copying the KV cache, so I wrote a paged-attention kernel that reads the cache in place. That cut a decode step from 80 to 29 milliseconds and took me from about a third of vLLM's throughput to 58–71%. Switching the attention partitions from 512 to 128 tokens then gained another 10–16% end to end, measured on the same T4 in November. The rest of the gap is decode-side, and I can show you with profiler numbers where it goes."
 
 ---
 
@@ -503,7 +544,10 @@ After the kernels, the remaining gap is entirely in decode (TPOT). Each cause, w
 | Prefix caching | p99 TTFT 2,714 → 707 ms (3.8x); 84% hit rate | `results/serving.jsonl` |
 | Chunked prefill | p99 ITL −44%; TTFT higher | `results/serving.jsonl` |
 | Naive server collapse | p99 TTFT 77.0 s at 16 users; flat 33 tok/s | `results/serving.jsonl` |
-| Tests | 29, all passing in CI | `tests/`, GitHub Actions |
+| Tests | 61 (60 passed, 1 skipped on CPU), all passing in CI | `tests/`, GitHub Actions |
+| G1: 128-token partitions | 1.10–1.16x engine-level throughput vs 512 (T4, Nov 14, 2026; transcribed from notebook output, raw zip not retained) | `notebooks/g1_partition_check.ipynb`, docs/vllm_gap.md |
+| CUDA graphs (G2 slice 1) | Landed opt-in (`--cuda-graphs`), CPU-verified; GPU verification pending | `tiny_infer/cuda_graphs.py`, docs/design.md §9 |
+| Engine process split (G3 slice 1) | Landed opt-in (`--engine-process`), CPU-verified; GPU verification pending | `tiny_infer/ipc.py`, `tiny_infer/engine_worker.py` |
 | Kernel numerical error | worst 2.0e-3 (FP16) | `results/kernel_bench.json` |
 | vLLM version | 0.31.0 (CUDA graphs, torch.compile, Triton attention) | `results/vllm_startup_evidence.txt` |
-| Code size | ~1,500 lines engine Python, ~480 CUDA/C++, ~1,700 bench/tests | repository |
+| Code size | ~2,100 lines engine Python, ~480 CUDA/C++, ~2,300 bench/tests | repository |
