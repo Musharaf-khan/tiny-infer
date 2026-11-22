@@ -32,8 +32,9 @@ def free_port():
 
 class FakeEngine:
     """Deterministic stand-in for LLMEngine: one token per step per sequence."""
-    def __init__(self, tokens_per_request=5):
+    def __init__(self, tokens_per_request=5, step_delay=0.0):
         self.tokens_per_request = tokens_per_request
+        self.step_delay = step_delay
         self._seqs: dict[str, Sequence] = {}
         self._emitted: dict[str, int] = {}
 
@@ -54,6 +55,8 @@ class FakeEngine:
         return bool(self._seqs)
 
     def step(self):
+        if self.step_delay:
+            time.sleep(self.step_delay)
         events = []
         for rid, seq in list(self._seqs.items()):
             n = self._emitted[rid] + 1
@@ -251,3 +254,163 @@ def test_http_server_with_remote_engine(tiny_model_dir, hf_model):
     finally:
         srv.should_exit = True
         backend.shutdown()
+
+
+# ------------------------------------------------- T3: transport boundary
+# G3 slice 1 covered order, multiplexing, abort, validation errors, stats and
+# token-identical end-to-end runs. What it did not cover: long streams with no
+# token loss across the boundary, malformed or unknown wire input, a dropped
+# connection mid-stream, and the stats timeout path. Those are this slice.
+
+def start_pair(tokens_per_request=5, step_delay=0.0):
+    """ipc_pair without the fixture, for tests that need a bigger FakeEngine."""
+    eng = FakeEngine(tokens_per_request, step_delay)
+    port = free_port()
+    t = threading.Thread(target=serve_engine, args=(eng, "127.0.0.1", port), daemon=True)
+    t.start()
+    return RemoteEngine("127.0.0.1", port), eng, t
+
+
+def stop_pair(client, t):
+    client.close()
+    t.join(timeout=10)
+    assert not t.is_alive(), "engine worker thread did not exit after close"
+
+
+def test_long_stream_no_token_loss():
+    client, _, t = start_pair(tokens_per_request=60)
+    try:
+        out, prompt_tokens, finish = asyncio.run(collect(client, [5, 6, 7], 60, "r-long"))
+        assert prompt_tokens == 3
+        assert out == list(range(1001, 1061)), "tokens lost, duplicated or reordered"
+        assert finish == "length"
+    finally:
+        stop_pair(client, t)
+
+
+def test_concurrent_long_streams_no_cross_talk():
+    client, _, t = start_pair(tokens_per_request=20)
+    try:
+        async def all_four():
+            return await asyncio.gather(
+                collect(client, [1], 20, "a"), collect(client, [2], 20, "b"),
+                collect(client, [3], 20, "c"), collect(client, [4], 20, "d"))
+        results = asyncio.run(all_four())
+        for (out, pt, fin), n in zip(results, (1, 2, 3, 4)):
+            assert out == list(range(1001, 1021)), f"request {n} lost or mixed tokens"
+            assert pt == 1 and fin == "length"
+    finally:
+        stop_pair(client, t)
+
+
+def test_abort_unknown_request_id_is_noop(ipc_pair):
+    client, _ = ipc_pair
+    client._send({"type": "abort", "request_id": "never-existed"})
+    out, _, finish = asyncio.run(collect(client, [5], 3, "r1"))
+    assert out == [1001, 1002, 1003] and finish == "length"
+
+
+def raw_server(port, handler):
+    """Accept one connection and drive it by hand (no engine behind it)."""
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        rf, wf = conn.makefile("rb"), conn.makefile("wb")
+        try:
+            handler(rf, wf)
+        except OSError:
+            pass
+        finally:
+            for f in (wf, rf):
+                try:
+                    f.close()
+                except OSError:
+                    pass
+            conn.close()
+            srv.close()
+    threading.Thread(target=serve, daemon=True).start()
+
+
+def test_malformed_and_unknown_wire_lines_ignored():
+    port = free_port()
+
+    def handler(rf, wf):
+        rf.readline()  # the "add" for r1
+        wf.write(b"this is not json\n")
+        wf.write(b'{"type": "mystery", "request_id": "r1"}\n')
+        wf.write(b'{"type": "prompt", "request_id": "r1", "prompt_tokens": 2}\n')
+        wf.write(b'{"type": "token", "request_id": "r1", "token_id": 42}\n')
+        wf.write(b'{"type": "done", "request_id": "r1", "finish_reason": "length"}\n')
+        wf.flush()
+        rf.readline()  # shutdown (or EOF when the client closes)
+
+    raw_server(port, handler)
+    client = RemoteEngine("127.0.0.1", port)
+    try:
+        out, prompt_tokens, finish = asyncio.run(collect(client, [5, 6], 1, "r1"))
+        assert prompt_tokens == 2 and out == [42] and finish == "length"
+    finally:
+        client.close()
+
+
+def test_connection_loss_mid_stream_errors_live_request():
+    port = free_port()
+
+    def handler(rf, wf):
+        rf.readline()  # the "add" for r1
+        wf.write(b'{"type": "prompt", "request_id": "r1", "prompt_tokens": 1}\n')
+        wf.write(b'{"type": "token", "request_id": "r1", "token_id": 7}\n')
+        wf.flush()
+        # close without a done: the client must surface the loss, not hang
+
+    raw_server(port, handler)
+    client = RemoteEngine("127.0.0.1", port)
+    try:
+        out, _, finish = asyncio.run(collect(client, [5], 10, "r1"))
+        assert out == [7]
+        assert finish == "error:engine connection lost"
+        assert client.stats() == {"error": "engine connection lost"}
+    finally:
+        client.close()
+
+
+def test_stats_timeout_when_engine_never_answers():
+    port = free_port()
+
+    def handler(rf, wf):
+        rf.readline()  # the "stats" request; never answered
+        time.sleep(3)
+
+    raw_server(port, handler)
+    client = RemoteEngine("127.0.0.1", port)
+    try:
+        assert client.stats(timeout=0.5) == {"error": "engine stats timeout"}
+    finally:
+        client.close()
+
+
+def test_close_with_live_request_shuts_worker_down():
+    # Slow steps: the engine loop steps as fast as possible, so an instant fake
+    # engine finishes a 50-token stream before the test can close mid-flight.
+    client, eng, t = start_pair(tokens_per_request=50, step_delay=0.2)
+    done = threading.Event()
+
+    def run_stream():
+        asyncio.run(collect(client, [5], 50, "r-live"))
+        done.set()
+
+    threading.Thread(target=run_stream, daemon=True).start()
+    for _ in range(100):
+        if eng._seqs:
+            break
+        time.sleep(0.05)
+    assert eng._seqs, "request never started before close"
+    client.close()
+    t.join(timeout=10)
+    assert not t.is_alive(), "worker did not exit after close with a live request"
+    assert done.wait(timeout=5), "live stream never ended after close"
