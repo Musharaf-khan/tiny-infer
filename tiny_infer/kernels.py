@@ -6,7 +6,7 @@ import os
 import torch
 
 CSRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
-SOURCES = ["ops.cpp", "rms_norm.cu", "paged_attention.cu"]
+SOURCES = ["ops.cpp", "rms_norm.cu", "paged_attention.cu", "rope_kv_write.cu"]
 
 
 def _arch_flags() -> list[str]:
@@ -59,6 +59,30 @@ def self_test(device: str = "cuda", seed: int = 0) -> dict:
         for ps in (512, 128):
             out = ops.paged_decode_attention(q, kc, vc, bt, lens, hd ** -0.5, int(lens.max()), True, ps)
             res[f"paged_attn[hq={hq},hkv={hkv},hd={hd},part={ps}]"] = (out.float() - ref.float()).abs().max().item()
+    # fused RoPE + KV-cache write: GQA 8 and 1, head_dim 64 and 128, shuffled cache slots
+    for hq, hkv, hd in ((32, 4, 64), (8, 8, 64), (16, 2, 128)):
+        T, nb, bs, max_pos = 37, 64, 16, 512
+        g2 = torch.Generator(device=device).manual_seed(seed + 1)
+        q, k, v = r(T, hq, hd), r(T, hkv, hd), r(T, hkv, hd)
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, hd, 2, device=device).float() / hd))
+        pos = torch.arange(max_pos, device=device, dtype=torch.float32)
+        freqs = pos[:, None] * inv_freq[None, :]
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos, sin = emb.cos().to(torch.float16), emb.sin().to(torch.float16)
+        positions = torch.randint(0, max_pos, (T,), generator=g2, device=device)
+        slots = torch.randperm(nb * bs, generator=g2, device=device)[:T]
+        kc = torch.zeros(nb, bs, hkv, hd, device=device, dtype=torch.float16)
+        vc = torch.zeros(nb, bs, hkv, hd, device=device, dtype=torch.float16)
+        kc_ref, vc_ref = kc.clone(), vc.clone()
+        q_ref, k_ref = ops.rope_kv_write_ref(q.clone(), k.clone(), v.clone(), cos, sin, positions,
+                                             slots, kc_ref, vc_ref)
+        qk, kk = ops.rope_kv_write(q.clone(), k.clone(), v.clone(), cos, sin, positions, slots,
+                                   kc, vc, True)
+        res[f"rope_kv_write[hq={hq},hkv={hkv},hd={hd}]"] = max(
+            (qk.float() - q_ref.float()).abs().max().item(),
+            (kk.float() - k_ref.float()).abs().max().item(),
+            (kc.float() - kc_ref.float()).abs().max().item(),
+            (vc.float() - vc_ref.float()).abs().max().item())
     return res
 
 

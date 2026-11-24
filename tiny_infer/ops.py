@@ -1,4 +1,4 @@
-"""The three ops the decode path spends its non-GEMM time in, each with two implementations:
+"""The ops the decode path spends its non-GEMM time in, each with two implementations:
 
     *_ref    plain PyTorch, numerically identical to HuggingFace's Llama (the correctness oracle)
     kernel   Project 1 CUDA kernels, registered as torch.library custom ops (torch.ops.tiny_infer.*)
@@ -25,6 +25,24 @@ def rms_norm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 def fused_add_rms_norm_ref(x, residual, w, eps):
     residual = x + residual
     return rms_norm_ref(residual, w, eps), residual
+
+
+def rope_kv_write_ref(q, k, v, cos, sin, positions, slot_mapping, k_cache, v_cache):
+    """Exactly what LlamaModel.forward did before G4: HF-style RoPE on q and k (rotate_half is
+    cat((-x[..., h:], x[..., :h]))), then scatter k/v into the paged cache at slot_mapping.
+    The correctness oracle for the fused kernel. Returns (q, k) with RoPE applied."""
+    h = q.shape[-1] // 2
+
+    def rotate(x):
+        return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
+
+    c = cos[positions].unsqueeze(1)      # [T, 1, hd]
+    s = sin[positions].unsqueeze(1)
+    q = q * c + rotate(q) * s
+    k = k * c + rotate(k) * s
+    k_cache.view(-1, k.shape[1], k.shape[2]).index_copy_(0, slot_mapping, k)
+    v_cache.view(-1, v.shape[1], v.shape[2]).index_copy_(0, slot_mapping, v.contiguous())
+    return q, k
 
 
 def paged_decode_attention_ref(q, k_cache, v_cache, block_tables, context_lens, scale, max_context_len):
@@ -108,3 +126,22 @@ def paged_decode_attention(q, k_cache, v_cache, block_tables, context_lens, scal
             int(partition_size))
         return out
     return paged_decode_attention_ref(q, k_cache, v_cache, block_tables, context_lens, scale, max_context_len)
+
+
+def rope_kv_write(q, k, v, cos, sin, positions, slot_mapping, k_cache, v_cache, use_custom=False):
+    """Fused RoPE + KV-cache write (G4 slice 1). Returns (q, k) with RoPE applied; the RoPE'd k
+    and the raw v are written into the paged cache at slot_mapping. On CPU, or without custom
+    kernels, this is the plain PyTorch path the model used before G4, so behaviour is identical.
+    The kernel mutates q and k in place; the reference returns new tensors."""
+    if use_custom:
+        if not _KERNELS_LOADED:
+            raise RuntimeError("use_custom_kernels=True but kernels are not loaded; call ops.load_kernels()")
+        if (all(t.is_cuda and t.dtype == torch.float16 for t in (q, k, v, cos, sin, k_cache, v_cache))
+                and positions.is_cuda and slot_mapping.is_cuda
+                and positions.dtype == torch.int64 and slot_mapping.dtype == torch.int64):
+            q, k = q.contiguous(), k.contiguous()
+            v = v.contiguous()
+            torch.ops.tiny_infer.rope_kv_write(
+                q, k, v, cos, sin, positions, slot_mapping, k_cache, v_cache)
+            return q, k
+    return rope_kv_write_ref(q, k, v, cos, sin, positions, slot_mapping, k_cache, v_cache)

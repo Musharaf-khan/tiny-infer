@@ -118,6 +118,8 @@ class LlamaModel:
         return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
 
     def _rope(self, q, k, positions):
+        # No longer on the forward path (G4 routes through ops.rope_kv_write); kept as the
+        # pre-G4 oracle: tests compare the dispatcher against this exact code.
         cos = self.cos[positions].unsqueeze(1)      # [T, 1, hd]
         sin = self.sin[positions].unsqueeze(1)
         return q * cos + self._rotate_half(q) * sin, k * cos + self._rotate_half(k) * sin
@@ -174,9 +176,8 @@ class LlamaModel:
             q = q.reshape(T, cfg.num_heads, hd)
             k = k.reshape(T, cfg.num_kv_heads, hd)
             v = v.reshape(T, cfg.num_kv_heads, hd)
-            q, k = self._rope(q, k, md.positions)
-            kv.k[i].view(-1, cfg.num_kv_heads, hd).index_copy_(0, md.slot_mapping, k)
-            kv.v[i].view(-1, cfg.num_kv_heads, hd).index_copy_(0, md.slot_mapping, v.contiguous())
+            q, k = ops.rope_kv_write(q, k, v, self.cos, self.sin, md.positions, md.slot_mapping,
+                                     kv.k[i], kv.v[i], self.use_custom_kernels)
             x = F.linear(self._attention(q, k, v, i, kv, md), L["o"])
             x, residual = self._add_norm(x, residual, L["post_norm"])
             if self.fuse:
